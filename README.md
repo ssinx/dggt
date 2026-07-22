@@ -110,6 +110,24 @@ python inference.py \
     -metrics: A flag that, when specified, enables the output of evaluation metrics (PSNR, SSIM, LPIPS) after processing (optional).
     -diffusion: Whether to use diffusion model to optimize the rendered images (time-consuming) (optional).
 
+### Inference on an ordinary image directory
+
+For an unlabelled image sequence, use `--plain_image_dir` instead of the processed-dataset arguments. The directory is searched recursively for `jpg`, `jpeg`, `png`, `bmp`, `tif`, `tiff`, and `webp` files. Files are naturally sorted by their relative paths and split into non-overlapping groups of `--sequence_length` images. Put temporally adjacent views of the same scene in the same directory; unrelated images cannot form a meaningful shared 3D reconstruction.
+
+```bash
+python inference.py \
+    --plain_image_dir /path/to/images \
+    --sequence_length 4 \
+    --start_idx 0 \
+    --mode 2 \
+    --ckpt_path pretrained/model_latest_waymo.pth \
+    --output_path /path/to/output \
+    -images \
+    -depth
+```
+
+This mode predicts poses, depth, and Gaussian attributes from the images themselves. It uses all-zero sky/dynamic masks because no annotations are available, so it does not generate `comparison.mp4` or support `-metrics`. Rendered frames and `rendered_video.mp4` are written to numbered subdirectories under `--output_path`; depth maps are saved when `-depth` is supplied.
+
 ### Train
 <!-- You need to further process the training data according to the .md file in the data processing section.  -->
 And download vggt pretrained model [here](https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt) to `pretrained/model.pt`.

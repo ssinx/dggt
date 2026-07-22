@@ -26,7 +26,7 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
 from gsplat.rendering import rasterization
-from datasets.dataset import WaymoOpenDataset
+from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset
 from utils.interplation import interp_all
 from utils.video_maker import make_comparison_video_quad
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
@@ -78,8 +78,10 @@ def parse_scene_names(scene_names_str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--image_dir', type=str, required=True, help='Path to the input images')
-    parser.add_argument('--scene_names', type=str, nargs='+', required=True, help='Scene names, supports formats like 3 5 7 or (3,7)')
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--image_dir', type=str, help='Path to a processed Waymo-style dataset')
+    input_group.add_argument('--plain_image_dir', type=str, help='Directory of ordinary images for unlabelled inference')
+    parser.add_argument('--scene_names', type=str, nargs='+', help='Scene names, supports formats like 3 5 7 or (3,7)')
     parser.add_argument('--input_views', type=int, default=1, help='Number of input views')
     parser.add_argument('--sequence_length', type=int, default=4, help='Number of input frames')
     parser.add_argument('--start_idx', type=int, default=0, help='Starting frame index')
@@ -92,14 +94,33 @@ def main():
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
     args = parser.parse_args()
+
+    plain_image_inference = args.plain_image_dir is not None
+    if plain_image_inference:
+        if args.mode != 2:
+            parser.error('--plain_image_dir supports only --mode 2')
+        if args.input_views != 1:
+            parser.error('--plain_image_dir supports only --input_views 1')
+        if args.metrics:
+            parser.error('-metrics requires ground-truth images and is unavailable with --plain_image_dir')
+    elif not args.scene_names:
+        parser.error('--scene_names is required when using --image_dir')
+
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
-    loss_fn = lpips.LPIPS(net='alex').to(device)
+    loss_fn = lpips.LPIPS(net='alex').to(device) if args.metrics else None
 
-    scene_names_str = ' '.join(args.scene_names)
-    scene_names = parse_scene_names(scene_names_str)
-    if args.mode == 3:
+    if plain_image_inference:
+        dataset = ImageDirectoryDataset(
+            args.plain_image_dir,
+            sequence_length=args.sequence_length,
+            start_idx=args.start_idx,
+        )
+    else:
+        scene_names_str = ' '.join(args.scene_names)
+        scene_names = parse_scene_names(scene_names_str)
+    if not plain_image_inference and args.mode == 3:
         dataset = WaymoOpenDataset(
             args.image_dir,
             scene_names=scene_names,
@@ -109,7 +130,7 @@ def main():
             views=args.input_views,
             intervals=args.intervals
         )
-    else:
+    elif not plain_image_inference:
         dataset = WaymoOpenDataset(
             args.image_dir,
             scene_names=scene_names,
@@ -137,8 +158,9 @@ def main():
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
-            gt_dy_map = batch['dynamic_mask'].to(device)
-            gt_depth = batch['gt_depth'].to(device)
+            if not plain_image_inference:
+                gt_dy_map = batch['dynamic_mask'].to(device)
+                gt_depth = batch['gt_depth'].to(device)
 
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
@@ -297,7 +319,7 @@ def main():
             scene_name = str(scene_idx).zfill(3)
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
-            if args.difix:
+            if args.diffusion:
                 processed_frames = []
                 for i in range(rendered_image.shape[0]):
                     frame = rendered_image[i].detach().cpu().clamp(0, 1)
@@ -305,10 +327,11 @@ def main():
                     processed_frames.append(processed_frame)
                 rendered_image = torch.stack(processed_frames, dim=0).to(device)
             
-            psnr, ssim, lpip = compute_metrics(rendered_image, target_image, loss_fn)
-            psnr_list.append(psnr)
-            ssim_list.append(ssim)
-            lpips_list.append(lpip)
+            if args.metrics:
+                psnr, ssim, lpip = compute_metrics(rendered_image, target_image, loss_fn)
+                psnr_list.append(psnr)
+                ssim_list.append(ssim)
+                lpips_list.append(lpip)
             scene_idx += 1
 
             scene_out_dir = os.path.join(args.output_path, scene_name)
@@ -356,24 +379,37 @@ def main():
                     video_path = os.path.join(scene_out_dir, "rendered_video.mp4")
                     imageio.mimwrite(video_path, np.array(video_list), fps=8, codec="libx264")
 
-            gt_frames = target_image.detach().cpu()
-            pred_frames = rendered_image.detach().cpu()
-            dyn_frames = dy_map[0].sigmoid().detach().cpu()
-            gt_dy_map = gt_dy_map.mean(dim=2)
-            gt_dy_map = gt_dy_map[0].sigmoid().detach().cpu()
             if args.mode == 2:
                 depth_frames = predictions["depth"][0].detach().cpu()
-                gt_depth = gt_depth[..., 0:1]
-                gt_depth = gt_depth[0].squeeze(-1).detach().cpu()
-                sky_mask = sky_mask.detach().cpu()
             if args.mode == 3:
                 depth_frames = depth_interp[0].detach().cpu()
+
+            if not plain_image_inference:
+                gt_frames = target_image.detach().cpu()
+                pred_frames = rendered_image.detach().cpu()
+                dyn_frames = dy_map[0].sigmoid().detach().cpu()
+                gt_dy_map = gt_dy_map.mean(dim=2)
+                gt_dy_map = gt_dy_map[0].sigmoid().detach().cpu()
                 gt_depth = gt_depth[..., 0:1]
                 gt_depth = gt_depth[0].squeeze(-1).detach().cpu()
-                sky_mask = target_sky_masks.permute(0, 1, 3, 4, 2).detach().cpu()
-            out_video = os.path.join(scene_out_dir, "comparison.mp4")
-            make_comparison_video_quad(gt_frames, pred_frames, gt_dy_map, dyn_frames, gt_depth ,depth_frames, sky_mask, out_video, fps=8, views = args.input_views )  #
-            print("Saved comparison video:", out_video)
+                if args.mode == 2:
+                    sky_mask = sky_mask.detach().cpu()
+                if args.mode == 3:
+                    sky_mask = target_sky_masks.permute(0, 1, 3, 4, 2).detach().cpu()
+                out_video = os.path.join(scene_out_dir, "comparison.mp4")
+                make_comparison_video_quad(
+                    gt_frames,
+                    pred_frames,
+                    gt_dy_map,
+                    dyn_frames,
+                    gt_depth,
+                    depth_frames,
+                    sky_mask,
+                    out_video,
+                    fps=8,
+                    views=args.input_views,
+                )
+                print("Saved comparison video:", out_video)
 
             if args.depth:
                 S = depth_frames.shape[0]

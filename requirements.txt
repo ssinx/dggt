@@ -22,6 +22,7 @@ rerun-sdk~=0.21
 numpy<2
 matplotlib
 imageio
+pillow
 trimesh
 huggingface_hub
 python-box[all]~=7.0

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.optim import Adam
 import os
+import re
 from IPython import embed
 from torch.utils.data import Dataset, DataLoader
 import random
@@ -134,6 +135,62 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
             images = images.unsqueeze(0)
 
     return images
+
+
+class ImageDirectoryDataset(Dataset):
+    """Loads ordinary image files for unlabelled reconstruction inference."""
+
+    image_extensions = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+
+    def __init__(self, image_dir, sequence_length=4, start_idx=0):
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be at least 1")
+
+        self.image_dir = os.path.abspath(image_dir)
+        if not os.path.isdir(self.image_dir):
+            raise FileNotFoundError(f"Image directory does not exist: {image_dir}")
+
+        image_paths = []
+        for root, dirnames, filenames in os.walk(self.image_dir):
+            dirnames.sort(key=self._natural_sort_key)
+            for filename in filenames:
+                if os.path.splitext(filename)[1].lower() in self.image_extensions:
+                    image_paths.append(os.path.join(root, filename))
+        image_paths.sort(key=lambda path: self._natural_sort_key(os.path.relpath(path, self.image_dir)))
+
+        if not image_paths:
+            raise ValueError(f"No supported images found under: {image_dir}")
+
+        if start_idx < 0 or start_idx >= len(image_paths):
+            raise ValueError(
+                f"start_idx must be in [0, {max(len(image_paths) - 1, 0)}], got {start_idx}"
+            )
+
+        image_paths = image_paths[start_idx:]
+        self.sequences = [
+            image_paths[index : index + sequence_length]
+            for index in range(0, len(image_paths), sequence_length)
+        ]
+
+    @staticmethod
+    def _natural_sort_key(value):
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        image_paths = self.sequences[idx]
+        images = load_and_preprocess_images(image_paths)
+        sequence_length, _, height, width = images.shape
+
+        return {
+            "images": images,
+            "masks": torch.zeros_like(images),
+            "dynamic_mask": torch.zeros(sequence_length, 1, height, width),
+            "gt_depth": torch.zeros(sequence_length, height, width),
+            "timestamps": torch.arange(sequence_length, dtype=torch.float32),
+        }
 
 
 class WaymoOpenDataset(Dataset):
