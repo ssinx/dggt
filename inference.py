@@ -72,16 +72,28 @@ def parse_scene_names(scene_names_str):
     scene_names_str = scene_names_str.strip()
     if scene_names_str.startswith("(") and scene_names_str.endswith(")"):
         start, end = scene_names_str[1:-1].split(",")
-        return [str(i).zfill(3) for i in range(int(start), int(end)+1)]
-    else:
-        return [str(int(x)).zfill(3) for x in scene_names_str.split()]
+        try:
+            return [str(i).zfill(3) for i in range(int(start), int(end) + 1)]
+        except ValueError as error:
+            raise ValueError(
+                "Scene ranges must use numeric IDs, for example '(3,7)'. "
+                "Pass named scenes as space-separated values instead."
+            ) from error
+
+    scene_names = []
+    for scene_name in scene_names_str.split():
+        try:
+            scene_names.append(str(int(scene_name)).zfill(3))
+        except ValueError:
+            scene_names.append(scene_name)
+    return scene_names
 
 def main():
     parser = argparse.ArgumentParser()
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--image_dir', type=str, help='Path to a processed Waymo-style dataset')
     input_group.add_argument('--plain_image_dir', type=str, help='Directory of ordinary images for unlabelled inference')
-    parser.add_argument('--scene_names', type=str, nargs='+', help='Scene names, supports formats like 3 5 7 or (3,7)')
+    parser.add_argument('--scene_names', type=str, nargs='+', help='Scene names, supports numeric IDs, named directories, or numeric ranges like (3,7)')
     parser.add_argument('--input_views', type=int, default=1, help='Number of input views')
     parser.add_argument('--sequence_length', type=int, default=4, help='Number of input frames')
     parser.add_argument('--start_idx', type=int, default=0, help='Starting frame index')
