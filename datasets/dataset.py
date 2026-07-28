@@ -194,7 +194,7 @@ class ImageDirectoryDataset(Dataset):
 
 
 class WaymoOpenDataset(Dataset):
-    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2):
+    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2, input_camera=0):
         #mode 1 : train
         #mode 2 : pure reconstruction
         #mode 3 : interplation
@@ -225,6 +225,9 @@ class WaymoOpenDataset(Dataset):
         self.test_mode = test_mode
         self.load_flow = load_flow
         self.views = views
+        if not 0 <= input_camera <= 4:
+            raise ValueError(f"input_camera must be in [0, 4], got {input_camera}")
+        self.input_camera = input_camera
 
         # Scan all scene folders and collect image paths
         if scene_names is None:
@@ -252,7 +255,7 @@ class WaymoOpenDataset(Dataset):
                         [
                             os.path.join(scene_path, f)
                             for f in os.listdir(scene_path)
-                            if f.endswith(("_0.jpg", "_0.png"))
+                            if f.endswith((f"_{self.input_camera}.jpg", f"_{self.input_camera}.png"))
                         ]
                     )
                     self.image_paths.append(image_paths)
@@ -274,7 +277,7 @@ class WaymoOpenDataset(Dataset):
                 if os.path.isdir(sky_mask_path):
                     if self.views == 1:
                         sky_mask_paths = sorted(
-                            [os.path.join(sky_mask_path, f) for f in os.listdir(sky_mask_path) if f.endswith(("_0.jpg", "_0.png"))]
+                            [os.path.join(sky_mask_path, f) for f in os.listdir(sky_mask_path) if f.endswith((f"_{self.input_camera}.jpg", f"_{self.input_camera}.png"))]
                         )
                         self.sky_mask_paths.append(sky_mask_paths)
                     elif self.views == 3:
@@ -303,14 +306,14 @@ class WaymoOpenDataset(Dataset):
                 ego_path = os.path.join(image_dir, scene_name, "extrinsics")
                 # ego_path = os.path.join(image_dir, scene_name, "extrinsics")
                 if os.path.isdir(ego_path):
-                    ego_path =  os.path.join(ego_path, "0.txt")
+                    ego_path = os.path.join(ego_path, f"{self.input_camera}.txt")
                     self.ego_paths.append(ego_path)
 
                 # intrinsic
                 intrinsic_path = os.path.join(image_dir, scene_name, "intrinsics")
                 if os.path.isdir(intrinsic_path):
                     if self.views == 1:
-                        intrinsic_paths = os.path.join(intrinsic_path, "0.txt")
+                        intrinsic_paths = os.path.join(intrinsic_path, f"{self.input_camera}.txt")
                         self.intrinsic_paths.append(intrinsic_paths)
                     elif self.views == 3:
                         intrinsics_views = []
@@ -326,7 +329,7 @@ class WaymoOpenDataset(Dataset):
                 if os.path.isdir(dynamic_mask_path):
                     if self.views == 1:
                         dynamic_mask_paths = sorted(
-                            [os.path.join(dynamic_mask_path, f) for f in os.listdir(dynamic_mask_path) if f.endswith(("_0.jpg", "_0.png"))]
+                            [os.path.join(dynamic_mask_path, f) for f in os.listdir(dynamic_mask_path) if f.endswith((f"_{self.input_camera}.jpg", f"_{self.input_camera}.png"))]
                         )
                         self.dynamic_mask_path.append(dynamic_mask_paths)
                     elif self.views == 3:
@@ -343,7 +346,7 @@ class WaymoOpenDataset(Dataset):
                 if os.path.isdir(depth_path):
                     if self.views == 1:
                         depth_paths = sorted(
-                            [os.path.join(depth_path, f) for f in os.listdir(depth_path) if f.endswith("_0.npy")]
+                            [os.path.join(depth_path, f) for f in os.listdir(depth_path) if f.endswith(f"_{self.input_camera}.npy")]
                         )
                         self.depth_flow_paths.append(depth_paths)
                     elif self.views == 3:
@@ -362,7 +365,7 @@ class WaymoOpenDataset(Dataset):
                 if os.path.isdir(semantic_mask_path):
                     if self.views == 1:
                         semantic_mask_paths = sorted(
-                            [os.path.join(semantic_mask_path, f) for f in os.listdir(semantic_mask_path) if f.endswith(("_0.jpg", "_0.png"))]
+                            [os.path.join(semantic_mask_path, f) for f in os.listdir(semantic_mask_path) if f.endswith((f"_{self.input_camera}.jpg", f"_{self.input_camera}.png"))]
                         )
                         self.semantic_mask_path.append(semantic_mask_paths)
                     elif self.views == 3:

@@ -29,6 +29,84 @@ from gsplat.rendering import rasterization
 from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset
 from utils.interplation import interp_all
 from utils.video_maker import make_comparison_video_quad
+
+
+OPENCV_TO_WAYMO = np.array(
+    [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]],
+    dtype=np.float32,
+)
+WAYMO_CAMERA_IDS = (0, 1, 2, 3, 4)
+
+
+def load_waymo_camera_calibrations(calibration_dir):
+    """Load raw Waymo camera-to-vehicle transforms and intrinsics."""
+    camera_to_ego = {}
+    camera_intrinsics = {}
+    for camera_id in WAYMO_CAMERA_IDS:
+        extrinsic_path = os.path.join(calibration_dir, "extrinsics", f"{camera_id}.txt")
+        intrinsic_path = os.path.join(calibration_dir, "intrinsics", f"{camera_id}.txt")
+        if not os.path.isfile(extrinsic_path) or not os.path.isfile(intrinsic_path):
+            raise FileNotFoundError(
+                f"Missing Waymo calibration for camera {camera_id} under {calibration_dir}. "
+                "Expected intrinsics/<camera_id>.txt and extrinsics/<camera_id>.txt."
+            )
+
+        extrinsic = np.loadtxt(extrinsic_path, dtype=np.float32)
+        intrinsic = np.loadtxt(intrinsic_path, dtype=np.float32).reshape(-1)
+        if extrinsic.shape != (4, 4):
+            raise ValueError(f"Expected a 4x4 extrinsic matrix in {extrinsic_path}, got {extrinsic.shape}.")
+        if intrinsic.shape[0] < 4:
+            raise ValueError(f"Expected at least [fx, fy, cx, cy] in {intrinsic_path}.")
+
+        camera_to_ego[camera_id] = extrinsic @ OPENCV_TO_WAYMO
+        camera_intrinsics[camera_id] = intrinsic[:4]
+
+    return camera_to_ego, camera_intrinsics
+
+
+def build_all_camera_render_poses(
+    source_extrinsics,
+    source_intrinsics,
+    camera_to_ego,
+    camera_intrinsics,
+    source_camera,
+):
+    """Build frame-major target poses for all Waymo cameras from one source camera."""
+    if source_camera not in WAYMO_CAMERA_IDS:
+        raise ValueError(f"source_camera must be one of {WAYMO_CAMERA_IDS}, got {source_camera}.")
+
+    device = source_extrinsics.device
+    dtype = source_extrinsics.dtype
+    source_camera_to_ego = torch.as_tensor(camera_to_ego[source_camera], device=device, dtype=dtype)
+    source_raw_intrinsics = torch.as_tensor(camera_intrinsics[source_camera], device=device, dtype=dtype)
+    if torch.any(source_raw_intrinsics[:2] <= 0):
+        raise ValueError(f"Camera {source_camera} has invalid focal lengths: {source_raw_intrinsics[:2].tolist()}")
+
+    relative_viewmats = []
+    target_intrinsics = []
+    for camera_id in WAYMO_CAMERA_IDS:
+        target_camera_to_ego = torch.as_tensor(camera_to_ego[camera_id], device=device, dtype=dtype)
+        relative_viewmats.append(torch.linalg.inv(target_camera_to_ego) @ source_camera_to_ego)
+
+        target_raw_intrinsics = torch.as_tensor(camera_intrinsics[camera_id], device=device, dtype=dtype)
+        target_intrinsic = source_intrinsics.clone()
+        scale_x = source_intrinsics[:, 0, 0] / source_raw_intrinsics[0]
+        scale_y = source_intrinsics[:, 1, 1] / source_raw_intrinsics[1]
+        target_intrinsic[:, 0, 0] = target_raw_intrinsics[0] * scale_x
+        target_intrinsic[:, 1, 1] = target_raw_intrinsics[1] * scale_y
+        target_intrinsic[:, 0, 2] = source_intrinsics[:, 0, 2] + (target_raw_intrinsics[2] - source_raw_intrinsics[2]) * scale_x
+        target_intrinsic[:, 1, 2] = source_intrinsics[:, 1, 2] + (target_raw_intrinsics[3] - source_raw_intrinsics[3]) * scale_y
+        target_intrinsics.append(target_intrinsic)
+
+    relative_viewmats = torch.stack(relative_viewmats, dim=0)
+    target_extrinsics = torch.matmul(relative_viewmats.unsqueeze(0), source_extrinsics.unsqueeze(1))
+    target_intrinsics = torch.stack(target_intrinsics, dim=1)
+    return (
+        target_extrinsics.flatten(0, 1),
+        target_intrinsics.flatten(0, 1),
+    )
+
+
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
     sigma = torch.log(torch.tensor(gamma1)).to(gamma0.device) / ((gamma0)**2 + 1e-6)
     conf = torch.exp(sigma*(t0-t)**2)
@@ -95,6 +173,7 @@ def main():
     input_group.add_argument('--plain_image_dir', type=str, help='Directory of ordinary images for unlabelled inference')
     parser.add_argument('--scene_names', type=str, nargs='+', help='Scene names, supports numeric IDs, named directories, or numeric ranges like (3,7)')
     parser.add_argument('--input_views', type=int, default=1, help='Number of input views')
+    parser.add_argument('--input_camera', type=int, default=0, choices=WAYMO_CAMERA_IDS, help='Waymo camera ID used when --input_views=1')
     parser.add_argument('--sequence_length', type=int, default=4, help='Number of input frames')
     parser.add_argument('--start_idx', type=int, default=0, help='Starting frame index')
     parser.add_argument('--mode', type=int, choices=[1,2,3], required=True, help='Processing mode')
@@ -105,6 +184,8 @@ def main():
     parser.add_argument('-metrics', action='store_true', help='Whether to output evaluation metrics')
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
+    parser.add_argument('--render_all_cameras', action='store_true', help='Render all five Waymo cameras from the selected single-camera input')
+    parser.add_argument('--calibration_dir', type=str, help='Optional scene directory containing intrinsics/ and extrinsics/')
     args = parser.parse_args()
 
     plain_image_inference = args.plain_image_dir is not None
@@ -117,6 +198,16 @@ def main():
             parser.error('-metrics requires ground-truth images and is unavailable with --plain_image_dir')
     elif not args.scene_names:
         parser.error('--scene_names is required when using --image_dir')
+
+    if args.render_all_cameras:
+        if plain_image_inference:
+            parser.error('--render_all_cameras requires a processed Waymo dataset passed with --image_dir')
+        if args.mode != 2:
+            parser.error('--render_all_cameras currently supports only --mode 2')
+        if args.input_views != 1:
+            parser.error('--render_all_cameras requires --input_views 1')
+        if args.metrics:
+            parser.error('-metrics cannot compare five rendered cameras to one source-camera ground truth')
 
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -140,7 +231,8 @@ def main():
             start_idx=args.start_idx,
             mode=args.mode,
             views=args.input_views,
-            intervals=args.intervals
+            intervals=args.intervals,
+            input_camera=args.input_camera,
         )
     elif not plain_image_inference:
         dataset = WaymoOpenDataset(
@@ -149,7 +241,8 @@ def main():
             sequence_length=args.sequence_length,
             start_idx=args.start_idx,
             mode=args.mode,
-            views=args.input_views
+            views=args.input_views,
+            input_camera=args.input_camera,
         )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
@@ -167,7 +260,8 @@ def main():
     scene_idx = 1
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
+            scene_name = scene_names[batch_idx] if not plain_image_inference else str(scene_idx).zfill(3)
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
             if not plain_image_inference:
@@ -264,6 +358,18 @@ def main():
                     dynamic_rotations.append(dynamic_rotation)
 
                 chunked_renders, chunked_alphas = [], []
+                source_extrinsic = extrinsic
+                source_intrinsic = intrinsic
+                if args.render_all_cameras:
+                    calibration_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
+                    camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(calibration_dir)
+                    render_extrinsic, render_intrinsic = build_all_camera_render_poses(
+                        source_extrinsic,
+                        source_intrinsic,
+                        camera_to_ego,
+                        camera_intrinsics,
+                        args.input_camera,
+                    )
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
                     origin_intrinsic = intrinsic   
@@ -277,18 +383,24 @@ def main():
                             [static_points, static_rgbs, static_opacity_, static_scales, static_rotation],
                             [dynamic_points[idx], dynamic_rgbs[idx], dynamic_opacitys[idx], dynamic_scales[idx], dynamic_rotations[idx]]
                         )   
-                        renders_chunk, alphas_chunk, _ = rasterization(
-                            means=world_points,
-                            quats=rotation,
-                            scales=scales,
-                            opacities=opacity,
-                            colors=rgbs,
-                            viewmats=extrinsic[idx:idx+1],
-                            Ks=intrinsic[idx:idx+1],
-                            width=W,
-                            height=H,
-                            render_mode='RGB+ED',  
-                        )
+                        for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
+                            render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
+                            viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
+                            Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
+                            renders_chunk, alphas_chunk, _ = rasterization(
+                                means=world_points,
+                                quats=rotation,
+                                scales=scales,
+                                opacities=opacity,
+                                colors=rgbs,
+                                viewmats=viewmats,
+                                Ks=Ks,
+                                width=W,
+                                height=H,
+                                render_mode='RGB+ED',
+                            )
+                            chunked_renders.append(renders_chunk)
+                            chunked_alphas.append(alphas_chunk)
                     if args.mode == 2:
                         t0 = timestamps[idx]
                         static_opacity_ = alpha_t(gs_timestamps, t0, static_opacity, gamma0 = static_gs_conf)
@@ -301,25 +413,38 @@ def main():
                         else:
                             world_points, rgbs, opacity, scales, rotation = static_gs_list
                         height_offset = 0
-                        renders_chunk, alphas_chunk, _ = rasterization(
-                            means=world_points,
-                            quats=rotation,
-                            scales=scales,
-                            opacities=opacity,
-                            colors=rgbs,
-                            viewmats=extrinsic[idx:idx+1],
-                            Ks=intrinsic[idx:idx+1],
-                            width=W,
-                            height=H,
-                            render_mode='RGB+ED',  
-                        )
-                    chunked_renders.append(renders_chunk)
-                    chunked_alphas.append(alphas_chunk)
+                        for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
+                            render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
+                            viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
+                            Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
+                            renders_chunk, alphas_chunk, _ = rasterization(
+                                means=world_points,
+                                quats=rotation,
+                                scales=scales,
+                                opacities=opacity,
+                                colors=rgbs,
+                                viewmats=viewmats,
+                                Ks=Ks,
+                                width=W,
+                                height=H,
+                                render_mode='RGB+ED',
+                            )
+                            chunked_renders.append(renders_chunk)
+                            chunked_alphas.append(alphas_chunk)
                 renders = torch.cat(chunked_renders, dim=0)
                 depth_maps = renders[..., -1]
                 renders = renders[..., :-1]
                 alphas = torch.cat(chunked_alphas, dim=0)
-                if args.mode == 3:
+                if args.render_all_cameras:
+                    bg_render = model.sky_model.forward_with_new_pose(
+                        images,
+                        source_extrinsic,
+                        source_intrinsic,
+                        render_extrinsic,
+                        render_intrinsic,
+                    )
+                    bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
+                elif args.mode == 3:
                     bg_render = model.sky_model.forward_with_new_pose(images,origin_extrinsic,origin_intrinsic, extrinsic, intrinsic)
                 if args.mode == 2:
                     bg_render = model.sky_model(images, extrinsic, intrinsic)
@@ -328,7 +453,6 @@ def main():
                 rendered_image = renders.permute(0, 3, 1, 2)
                 target_image = images[0]
 
-            scene_name = str(scene_idx).zfill(3)
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
             if args.diffusion:
@@ -349,8 +473,15 @@ def main():
             scene_out_dir = os.path.join(args.output_path, scene_name)
             os.makedirs(scene_out_dir, exist_ok=True)
 
-            if args.images:
-                if args.input_views == 1:
+            if args.images or args.render_all_cameras:
+                if args.render_all_cameras:
+                    for frame_idx in range(source_extrinsic.shape[0]):
+                        for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
+                            rendered = rendered_image[frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset].detach().cpu().clamp(0, 1)
+                            camera_out_dir = os.path.join(scene_out_dir, f"camera_{camera_id}")
+                            os.makedirs(camera_out_dir, exist_ok=True)
+                            T.ToPILImage()(rendered).save(os.path.join(camera_out_dir, f"frame_{frame_idx:04d}.png"))
+                elif args.input_views == 1:
                     image_list = []
                     for i in range(rendered_image.shape[0]):
                         rendered = rendered_image[i].detach().cpu().clamp(0, 1)
@@ -359,7 +490,7 @@ def main():
                         image_list.append(rendered.permute(1, 2, 0).numpy())
                     video_path = os.path.join(scene_out_dir, "rendered_video.mp4")
                     imageio.mimwrite(video_path, (np.array(image_list) * 255).astype(np.uint8), fps=8, codec="libx264")
-                if args.input_views == 3:
+                elif args.input_views == 3:
                     T_total = rendered_image.shape[0]
                     groups = T_total // 3
                     video_list = []
@@ -396,7 +527,7 @@ def main():
             if args.mode == 3:
                 depth_frames = depth_interp[0].detach().cpu()
 
-            if not plain_image_inference:
+            if not plain_image_inference and not args.render_all_cameras:
                 gt_frames = target_image.detach().cpu()
                 pred_frames = rendered_image.detach().cpu()
                 dyn_frames = dy_map[0].sigmoid().detach().cpu()
