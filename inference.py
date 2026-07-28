@@ -446,9 +446,13 @@ def main():
                     bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
                 elif args.mode == 3:
                     bg_render = model.sky_model.forward_with_new_pose(images,origin_extrinsic,origin_intrinsic, extrinsic, intrinsic)
-                if args.mode == 2:
+                elif args.mode == 2:
                     bg_render = model.sky_model(images, extrinsic, intrinsic)
                     bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)  #
+                if bg_render.shape[0] != renders.shape[0]:
+                    raise RuntimeError(
+                        f"Foreground and sky render counts differ: {renders.shape[0]} and {bg_render.shape[0]}."
+                    )
                 renders = alphas * renders + (1 - alphas) * bg_render
                 rendered_image = renders.permute(0, 3, 1, 2)
                 target_image = images[0]
