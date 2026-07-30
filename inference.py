@@ -64,6 +64,85 @@ def load_waymo_camera_calibrations(calibration_dir):
     return camera_to_ego, camera_intrinsics
 
 
+def canonicalize_waymo_camera_calibrations(camera_to_ego, camera_intrinsics):
+    headings = {}
+    for stored_camera_id, camera_pose in camera_to_ego.items():
+        camera_forward_in_vehicle = camera_pose[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        headings[stored_camera_id] = float(np.arctan2(camera_forward_in_vehicle[1], camera_forward_in_vehicle[0]))
+
+    front_camera = min(headings, key=lambda camera_id: abs(headings[camera_id]))
+    remaining_camera_ids = [camera_id for camera_id in WAYMO_CAMERA_IDS if camera_id != front_camera]
+    left_cameras = sorted(
+        (camera_id for camera_id in remaining_camera_ids if headings[camera_id] > 0),
+        key=lambda camera_id: abs(headings[camera_id]),
+    )
+    right_cameras = sorted(
+        (camera_id for camera_id in remaining_camera_ids if headings[camera_id] < 0),
+        key=lambda camera_id: abs(headings[camera_id]),
+    )
+    if len(left_cameras) != 2 or len(right_cameras) != 2:
+        heading_degrees = {camera_id: round(np.degrees(heading), 2) for camera_id, heading in headings.items()}
+        raise ValueError(
+            "Cannot recover canonical Waymo camera IDs from calibration headings: "
+            f"{heading_degrees}."
+        )
+
+    canonical_to_stored = {
+        0: front_camera,
+        1: left_cameras[0],
+        2: right_cameras[0],
+        3: left_cameras[1],
+        4: right_cameras[1],
+    }
+    canonical_camera_to_ego = {
+        canonical_camera_id: camera_to_ego[stored_camera_id]
+        for canonical_camera_id, stored_camera_id in canonical_to_stored.items()
+    }
+    canonical_camera_intrinsics = {
+        canonical_camera_id: camera_intrinsics[stored_camera_id]
+        for canonical_camera_id, stored_camera_id in canonical_to_stored.items()
+    }
+    return canonical_camera_to_ego, canonical_camera_intrinsics, canonical_to_stored
+
+
+def format_camera_rig_directions(camera_to_ego, source_camera):
+    source_camera_to_ego = camera_to_ego[source_camera]
+    camera_directions = []
+    for camera_id in WAYMO_CAMERA_IDS:
+        target_camera_to_ego = camera_to_ego[camera_id]
+        source_to_target = np.linalg.inv(target_camera_to_ego) @ source_camera_to_ego
+        target_forward_in_source = source_to_target[:3, :3].T @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        yaw_degrees = np.degrees(np.arctan2(target_forward_in_source[0], target_forward_in_source[2]))
+        target_center_in_source = np.linalg.inv(source_to_target)[:3, 3]
+        camera_directions.append(
+            f"camera_{camera_id}: yaw={yaw_degrees:+.1f}deg, "
+            f"center=({target_center_in_source[0]:+.2f}, {target_center_in_source[1]:+.2f}, {target_center_in_source[2]:+.2f})m"
+        )
+    return "; ".join(camera_directions)
+
+
+def compute_source_point_frustum_coverage(point_map, render_extrinsic, render_intrinsic, height, width, stride=16):
+    sampled_point_map = point_map[0, :, ::stride, ::stride].reshape(point_map.shape[1], -1, 3)
+    coverage = []
+    for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
+        visible_points = 0
+        total_points = 0
+        for frame_idx, world_points in enumerate(sampled_point_map):
+            render_idx = frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset
+            viewmat = render_extrinsic[render_idx]
+            intrinsic = render_intrinsic[render_idx]
+            camera_points = world_points @ viewmat[:3, :3].transpose(0, 1) + viewmat[:3, 3]
+            depth = camera_points[:, 2]
+            valid_depth = depth > 1e-5
+            projected_x = intrinsic[0, 0] * camera_points[:, 0] / depth.clamp_min(1e-5) + intrinsic[0, 2]
+            projected_y = intrinsic[1, 1] * camera_points[:, 1] / depth.clamp_min(1e-5) + intrinsic[1, 2]
+            visible = valid_depth & (projected_x >= 0) & (projected_x < width) & (projected_y >= 0) & (projected_y < height)
+            visible_points += visible.sum().item()
+            total_points += visible.numel()
+        coverage.append((camera_id, visible_points / max(total_points, 1)))
+    return coverage
+
+
 def build_all_camera_render_poses(
     source_extrinsics,
     source_intrinsics,
@@ -425,12 +504,18 @@ def main():
                 if args.render_all_cameras:
                     scene_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
                     camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(scene_dir)
+                    camera_to_ego, camera_intrinsics, canonical_to_stored = canonicalize_waymo_camera_calibrations(
+                        camera_to_ego,
+                        camera_intrinsics,
+                    )
                     rig_translation_scale = args.camera_rig_scale or estimate_waymo_rig_translation_scale(
                         scene_dir,
                         batch['image_paths'],
                         source_extrinsic,
                     )
                     print(f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f}")
+                    print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
+                    print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, args.input_camera)}")
                     render_extrinsic, render_intrinsic = build_all_camera_render_poses(
                         source_extrinsic,
                         source_intrinsic,
@@ -438,6 +523,17 @@ def main():
                         camera_intrinsics,
                         args.input_camera,
                         rig_translation_scale,
+                    )
+                    frustum_coverage = compute_source_point_frustum_coverage(
+                        point_map,
+                        render_extrinsic,
+                        render_intrinsic,
+                        H,
+                        W,
+                    )
+                    print(
+                        f"Source-depth frustum coverage for scene {scene_name}: "
+                        + ", ".join(f"camera_{camera_id}={coverage:.4f}" for camera_id, coverage in frustum_coverage)
                     )
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
