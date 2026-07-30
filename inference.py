@@ -578,7 +578,7 @@ def main():
                     print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, args.input_camera)}")
                     print(
                         f"Model source FOV for scene {scene_name}: "
-                        f"({torch.rad2deg(2 * torch.atan(W / (2 * model_source_intrinsic[0, 0]))).item():.1f}, "
+                        f"({torch.rad2deg(2 * torch.atan(W / (2 * model_source_intrinsic[0, 0, 0]))).item():.1f}, "
                         f"{torch.rad2deg(2 * torch.atan(H / (2 * model_source_intrinsic[0, 1, 1]))).item():.1f})deg"
                     )
                     print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, W, H)}")
