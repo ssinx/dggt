@@ -70,10 +70,13 @@ def build_all_camera_render_poses(
     camera_to_ego,
     camera_intrinsics,
     source_camera,
+    rig_translation_scale,
 ):
     """Build frame-major target poses for all Waymo cameras from one source camera."""
     if source_camera not in WAYMO_CAMERA_IDS:
         raise ValueError(f"source_camera must be one of {WAYMO_CAMERA_IDS}, got {source_camera}.")
+    if rig_translation_scale <= 0:
+        raise ValueError(f"rig_translation_scale must be positive, got {rig_translation_scale}.")
 
     device = source_extrinsics.device
     dtype = source_extrinsics.dtype
@@ -86,7 +89,9 @@ def build_all_camera_render_poses(
     target_intrinsics = []
     for camera_id in WAYMO_CAMERA_IDS:
         target_camera_to_ego = torch.as_tensor(camera_to_ego[camera_id], device=device, dtype=dtype)
-        relative_viewmats.append(torch.linalg.inv(target_camera_to_ego) @ source_camera_to_ego)
+        relative_viewmat = torch.linalg.inv(target_camera_to_ego) @ source_camera_to_ego
+        relative_viewmat[:3, 3] *= rig_translation_scale
+        relative_viewmats.append(relative_viewmat)
 
         target_raw_intrinsics = torch.as_tensor(camera_intrinsics[camera_id], device=device, dtype=dtype)
         target_intrinsic = source_intrinsics.clone()
@@ -105,6 +110,60 @@ def build_all_camera_render_poses(
         target_extrinsics.flatten(0, 1),
         target_intrinsics.flatten(0, 1),
     )
+
+
+def get_frame_ids_from_image_paths(image_paths):
+    frame_ids = []
+    for image_path in image_paths:
+        while isinstance(image_path, (list, tuple)):
+            if len(image_path) == 0:
+                raise ValueError("Encountered an empty image path batch entry.")
+            image_path = image_path[0]
+        frame_name = os.path.basename(os.fspath(image_path))
+        try:
+            frame_ids.append(int(frame_name.split("_", maxsplit=1)[0]))
+        except ValueError as error:
+            raise ValueError(f"Cannot extract a Waymo frame ID from {frame_name}.") from error
+    return frame_ids
+
+
+def estimate_waymo_rig_translation_scale(scene_dir, image_paths, source_extrinsics):
+    frame_ids = get_frame_ids_from_image_paths(image_paths)
+    if len(frame_ids) != source_extrinsics.shape[0]:
+        raise ValueError(
+            f"Got {len(frame_ids)} input frame paths but {source_extrinsics.shape[0]} predicted poses."
+        )
+
+    ego_positions = []
+    for frame_id in frame_ids:
+        ego_pose_path = os.path.join(scene_dir, "ego_pose", f"{frame_id:03d}.txt")
+        if not os.path.isfile(ego_pose_path):
+            raise FileNotFoundError(
+                f"Missing ego pose {ego_pose_path}; it is required to align the Waymo rig translation scale."
+            )
+        ego_pose = np.loadtxt(ego_pose_path, dtype=np.float32)
+        if ego_pose.shape != (4, 4):
+            raise ValueError(f"Expected a 4x4 ego pose matrix in {ego_pose_path}, got {ego_pose.shape}.")
+        ego_positions.append(ego_pose[:3, 3])
+
+    source_rotations = source_extrinsics[:, :3, :3]
+    source_translations = source_extrinsics[:, :3, 3]
+    source_camera_positions = -torch.bmm(
+        source_rotations.transpose(1, 2),
+        source_translations.unsqueeze(-1),
+    ).squeeze(-1).detach().float().cpu().numpy()
+    ego_positions = np.stack(ego_positions, axis=0)
+
+    model_displacements = np.linalg.norm(source_camera_positions[1:] - source_camera_positions[0], axis=1)
+    ego_displacements = np.linalg.norm(ego_positions[1:] - ego_positions[0], axis=1)
+    valid = (model_displacements > 1e-5) & (ego_displacements > 1e-5)
+    if not np.any(valid):
+        raise ValueError("Cannot estimate the Waymo rig scale because the selected sequence has no measurable motion.")
+
+    rig_translation_scale = float(np.median(model_displacements[valid] / ego_displacements[valid]))
+    if not np.isfinite(rig_translation_scale) or rig_translation_scale <= 0:
+        raise ValueError(f"Invalid estimated Waymo rig translation scale: {rig_translation_scale}.")
+    return rig_translation_scale
 
 
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
@@ -186,6 +245,7 @@ def main():
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
     parser.add_argument('--render_all_cameras', action='store_true', help='Render all five Waymo cameras from the selected single-camera input')
     parser.add_argument('--calibration_dir', type=str, help='Optional scene directory containing intrinsics/ and extrinsics/')
+    parser.add_argument('--camera_rig_scale', type=float, help='Optional model-units-per-meter scale for Waymo camera rig translations')
     args = parser.parse_args()
 
     plain_image_inference = args.plain_image_dir is not None
@@ -208,6 +268,8 @@ def main():
             parser.error('--render_all_cameras requires --input_views 1')
         if args.metrics:
             parser.error('-metrics cannot compare five rendered cameras to one source-camera ground truth')
+        if args.camera_rig_scale is not None and args.camera_rig_scale <= 0:
+            parser.error('--camera_rig_scale must be positive')
 
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -361,14 +423,21 @@ def main():
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
                 if args.render_all_cameras:
-                    calibration_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
-                    camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(calibration_dir)
+                    scene_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
+                    camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(scene_dir)
+                    rig_translation_scale = args.camera_rig_scale or estimate_waymo_rig_translation_scale(
+                        scene_dir,
+                        batch['image_paths'],
+                        source_extrinsic,
+                    )
+                    print(f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f}")
                     render_extrinsic, render_intrinsic = build_all_camera_render_poses(
                         source_extrinsic,
                         source_intrinsic,
                         camera_to_ego,
                         camera_intrinsics,
                         args.input_camera,
+                        rig_translation_scale,
                     )
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
@@ -453,6 +522,12 @@ def main():
                     raise RuntimeError(
                         f"Foreground and sky render counts differ: {renders.shape[0]} and {bg_render.shape[0]}."
                     )
+                if args.render_all_cameras:
+                    coverage = []
+                    for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
+                        camera_alpha = alphas[camera_offset::len(WAYMO_CAMERA_IDS)]
+                        coverage.append(f"camera_{camera_id}={camera_alpha.mean().item():.4f}")
+                    print(f"Gaussian alpha coverage for scene {scene_name}: {', '.join(coverage)}")
                 renders = alphas * renders + (1 - alphas) * bg_render
                 rendered_image = renders.permute(0, 3, 1, 2)
                 target_image = images[0]
