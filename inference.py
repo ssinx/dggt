@@ -143,11 +143,71 @@ def compute_source_point_frustum_coverage(point_map, render_extrinsic, render_in
     return coverage
 
 
+def find_waymo_image_path(scene_dir, frame_id, camera_id):
+    image_stem = os.path.join(scene_dir, "images", f"{frame_id:03d}_{camera_id}")
+    for extension in (".jpg", ".png"):
+        image_path = image_stem + extension
+        if os.path.isfile(image_path):
+            return image_path
+    raise FileNotFoundError(f"Missing image for Waymo frame {frame_id}, camera {camera_id} under {scene_dir}/images.")
+
+
+def build_preprocessed_waymo_intrinsic(image_path, raw_intrinsic, output_height, output_width):
+    with Image.open(image_path) as image:
+        original_width, original_height = image.size
+
+    resize_width = 518
+    if output_width != resize_width:
+        raise ValueError(f"Expected model input width {resize_width}, got {output_width}.")
+    resize_scale = resize_width / original_width
+    resized_height = round(original_height * resize_scale / 14) * 14
+    intrinsic = np.array(
+        [
+            [raw_intrinsic[0] * resize_scale, 0.0, raw_intrinsic[2] * resize_scale],
+            [0.0, raw_intrinsic[1] * resize_scale, raw_intrinsic[3] * resize_scale],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    if resized_height > output_height:
+        intrinsic[1, 2] -= (resized_height - output_height) // 2
+    elif resized_height < output_height:
+        intrinsic[1, 2] += (output_height - resized_height) // 2
+    return intrinsic
+
+
+def build_waymo_render_intrinsics(scene_dir, frame_ids, camera_intrinsics, output_height, output_width, device, dtype):
+    if len(frame_ids) == 0:
+        raise ValueError("At least one Waymo frame is required to build calibrated intrinsics.")
+    render_intrinsics = {}
+    for camera_id in WAYMO_CAMERA_IDS:
+        image_path = find_waymo_image_path(scene_dir, frame_ids[0], camera_id)
+        intrinsic = build_preprocessed_waymo_intrinsic(
+            image_path,
+            camera_intrinsics[camera_id],
+            output_height,
+            output_width,
+        )
+        render_intrinsics[camera_id] = torch.as_tensor(intrinsic, device=device, dtype=dtype).unsqueeze(0).expand(
+            len(frame_ids), -1, -1
+        ).clone()
+    return render_intrinsics
+
+
+def format_camera_fovs(intrinsics, width, height):
+    fovs = []
+    for camera_id in WAYMO_CAMERA_IDS:
+        intrinsic = intrinsics[camera_id][0]
+        fov_x = torch.rad2deg(2 * torch.atan(torch.tensor(width, device=intrinsic.device, dtype=intrinsic.dtype) / (2 * intrinsic[0, 0])))
+        fov_y = torch.rad2deg(2 * torch.atan(torch.tensor(height, device=intrinsic.device, dtype=intrinsic.dtype) / (2 * intrinsic[1, 1])))
+        fovs.append(f"camera_{camera_id}=({fov_x.item():.1f}, {fov_y.item():.1f})deg")
+    return ", ".join(fovs)
+
+
 def build_all_camera_render_poses(
     source_extrinsics,
-    source_intrinsics,
     camera_to_ego,
-    camera_intrinsics,
+    render_intrinsics,
     source_camera,
     rig_translation_scale,
 ):
@@ -160,31 +220,17 @@ def build_all_camera_render_poses(
     device = source_extrinsics.device
     dtype = source_extrinsics.dtype
     source_camera_to_ego = torch.as_tensor(camera_to_ego[source_camera], device=device, dtype=dtype)
-    source_raw_intrinsics = torch.as_tensor(camera_intrinsics[source_camera], device=device, dtype=dtype)
-    if torch.any(source_raw_intrinsics[:2] <= 0):
-        raise ValueError(f"Camera {source_camera} has invalid focal lengths: {source_raw_intrinsics[:2].tolist()}")
 
     relative_viewmats = []
-    target_intrinsics = []
     for camera_id in WAYMO_CAMERA_IDS:
         target_camera_to_ego = torch.as_tensor(camera_to_ego[camera_id], device=device, dtype=dtype)
         relative_viewmat = torch.linalg.inv(target_camera_to_ego) @ source_camera_to_ego
         relative_viewmat[:3, 3] *= rig_translation_scale
         relative_viewmats.append(relative_viewmat)
 
-        target_raw_intrinsics = torch.as_tensor(camera_intrinsics[camera_id], device=device, dtype=dtype)
-        target_intrinsic = source_intrinsics.clone()
-        scale_x = source_intrinsics[:, 0, 0] / source_raw_intrinsics[0]
-        scale_y = source_intrinsics[:, 1, 1] / source_raw_intrinsics[1]
-        target_intrinsic[:, 0, 0] = target_raw_intrinsics[0] * scale_x
-        target_intrinsic[:, 1, 1] = target_raw_intrinsics[1] * scale_y
-        target_intrinsic[:, 0, 2] = source_intrinsics[:, 0, 2] + (target_raw_intrinsics[2] - source_raw_intrinsics[2]) * scale_x
-        target_intrinsic[:, 1, 2] = source_intrinsics[:, 1, 2] + (target_raw_intrinsics[3] - source_raw_intrinsics[3]) * scale_y
-        target_intrinsics.append(target_intrinsic)
-
     relative_viewmats = torch.stack(relative_viewmats, dim=0)
     target_extrinsics = torch.matmul(relative_viewmats.unsqueeze(0), source_extrinsics.unsqueeze(1))
-    target_intrinsics = torch.stack(target_intrinsics, dim=1)
+    target_intrinsics = torch.stack([render_intrinsics[camera_id] for camera_id in WAYMO_CAMERA_IDS], dim=1)
     return (
         target_extrinsics.flatten(0, 1),
         target_intrinsics.flatten(0, 1),
@@ -430,8 +476,28 @@ def main():
                 bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=extrinsic.device).view(1, 1, 4).expand(extrinsic.shape[0], 1, 4)
                 extrinsic = torch.cat([extrinsic, bottom], dim=1)
                 intrinsic = intrinsics[0]
+                model_source_intrinsic = intrinsic.clone()
                 intervals=args.intervals
                 views=args.input_views
+
+                if args.render_all_cameras:
+                    scene_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
+                    camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(scene_dir)
+                    camera_to_ego, camera_intrinsics, canonical_to_stored = canonicalize_waymo_camera_calibrations(
+                        camera_to_ego,
+                        camera_intrinsics,
+                    )
+                    frame_ids = get_frame_ids_from_image_paths(batch['image_paths'])
+                    render_intrinsics = build_waymo_render_intrinsics(
+                        scene_dir,
+                        frame_ids,
+                        camera_intrinsics,
+                        H,
+                        W,
+                        device,
+                        intrinsic.dtype,
+                    )
+                    intrinsic = render_intrinsics[args.input_camera]
 
                 use_depth = True
                 if use_depth:
@@ -502,12 +568,6 @@ def main():
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
                 if args.render_all_cameras:
-                    scene_dir = args.calibration_dir or os.path.join(args.image_dir, scene_name)
-                    camera_to_ego, camera_intrinsics = load_waymo_camera_calibrations(scene_dir)
-                    camera_to_ego, camera_intrinsics, canonical_to_stored = canonicalize_waymo_camera_calibrations(
-                        camera_to_ego,
-                        camera_intrinsics,
-                    )
                     rig_translation_scale = args.camera_rig_scale or estimate_waymo_rig_translation_scale(
                         scene_dir,
                         batch['image_paths'],
@@ -516,11 +576,16 @@ def main():
                     print(f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f}")
                     print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
                     print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, args.input_camera)}")
+                    print(
+                        f"Model source FOV for scene {scene_name}: "
+                        f"({torch.rad2deg(2 * torch.atan(W / (2 * model_source_intrinsic[0, 0]))).item():.1f}, "
+                        f"{torch.rad2deg(2 * torch.atan(H / (2 * model_source_intrinsic[0, 1, 1]))).item():.1f})deg"
+                    )
+                    print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, W, H)}")
                     render_extrinsic, render_intrinsic = build_all_camera_render_poses(
                         source_extrinsic,
-                        source_intrinsic,
                         camera_to_ego,
-                        camera_intrinsics,
+                        render_intrinsics,
                         args.input_camera,
                         rig_translation_scale,
                     )
