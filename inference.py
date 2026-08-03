@@ -529,6 +529,12 @@ def main():
     )
     parser.add_argument('--sequence_length', type=int, default=4, help='Number of input frames')
     parser.add_argument('--start_idx', type=int, default=0, help='Starting frame index')
+    parser.add_argument(
+        '--input_frame_stride',
+        type=int,
+        default=1,
+        help='Frame interval for Waymo mode 2 inputs; 1 uses consecutive frames',
+    )
     parser.add_argument('--mode', type=int, choices=[1,2,3], required=True, help='Processing mode')
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to the model weights')
     parser.add_argument('--output_path', type=str, required=True, help='Output directory for results')
@@ -550,6 +556,8 @@ def main():
             parser.error('--input_camera is required with --image_dir')
     if len(set(args.input_camera)) != len(args.input_camera):
         parser.error('--input_camera values must be unique')
+    if args.input_frame_stride < 1:
+        parser.error('--input_frame_stride must be at least 1')
     if args.input_views is not None and args.input_views != len(args.input_camera):
         parser.error('--input_views must equal the number of IDs passed to --input_camera')
     args.input_views = len(args.input_camera)
@@ -560,6 +568,8 @@ def main():
             parser.error('--plain_image_dir supports only --mode 2')
         if args.input_views != 1:
             parser.error('--plain_image_dir supports only --input_views 1')
+        if args.input_frame_stride != 1:
+            parser.error('--input_frame_stride is only supported with --image_dir')
         if args.metrics:
             parser.error('-metrics requires ground-truth images and is unavailable with --plain_image_dir')
     elif not args.scene_names:
@@ -600,6 +610,7 @@ def main():
             mode=args.mode,
             views=args.input_views,
             intervals=args.intervals,
+            frame_stride=args.input_frame_stride,
             input_camera=args.input_camera,
         )
     elif not plain_image_inference:
@@ -610,6 +621,7 @@ def main():
             start_idx=args.start_idx,
             mode=args.mode,
             views=args.input_views,
+            frame_stride=args.input_frame_stride,
             input_camera=args.input_camera,
         )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)

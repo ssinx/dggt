@@ -671,10 +671,13 @@ class WaymoOpenDataset(Dataset):
         mode=1,
         views=1,
         intervals=2,
+        frame_stride=1,
         input_camera=0,
     ):
         if sequence_length is None or sequence_length < 1:
             raise ValueError("sequence_length must be at least 1")
+        if frame_stride < 1:
+            raise ValueError(f"frame_stride must be at least 1, got {frame_stride}")
         input_cameras = (input_camera,) if isinstance(input_camera, int) else tuple(input_camera)
         if not input_cameras:
             raise ValueError("At least one input camera must be specified.")
@@ -692,6 +695,7 @@ class WaymoOpenDataset(Dataset):
         self.start_idx = start_idx
         self.mode = mode
         self.interval = intervals if mode == 3 else 1
+        self.frame_stride = frame_stride
         self.views = len(input_cameras)
         self.input_cameras = input_cameras
         self.input_camera = input_cameras[0]
@@ -774,9 +778,9 @@ class WaymoOpenDataset(Dataset):
             intervals = [1 for _ in range(self.sequence_length - 1)]
         elif self.mode == 2:
             start_idx = self.start_idx
-            indices = [start_idx + frame_index for frame_index in range(self.sequence_length)]
+            indices = [start_idx + frame_index * self.frame_stride for frame_index in range(self.sequence_length)]
             target_indices = None
-            intervals = [1 for _ in range(self.sequence_length - 1)]
+            intervals = [self.frame_stride for _ in range(self.sequence_length - 1)]
         elif self.mode == 3:
             start_idx = self.start_idx
             indices = [start_idx + frame_index * self.interval for frame_index in range(self.sequence_length)]
