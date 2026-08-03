@@ -13,6 +13,9 @@ Annotate one image:
 Annotate every supported image in a directory:
     python scripts/gemini_scene_annotate.py path/to/images --output-dir outputs/gemini
 
+Render visualization files for annotations that already exist:
+    python scripts/gemini_scene_annotate.py path/to/images --output-dir outputs/gemini --visualize-only
+
 The generated labels are image-plane weak annotations.  Lane points and boxes
 use the [0, 1000] normalized image coordinate system, not metric BEV or 3D
 coordinates.  Use a calibrated geometry stage to convert them to BEV/3D.
@@ -28,11 +31,33 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from PIL import ImageDraw, ImageFont
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 COORDINATE_RANGE = 1000
+LANE_COLORS = {
+    "ego": "#00e5ff",
+    "left_of_ego": "#00ff73",
+    "right_of_ego": "#ff9d00",
+    "oncoming": "#ff4d6d",
+    "crossing": "#bd93f9",
+    "unknown": "#ffffff",
+}
+OBJECT_COLORS = {
+    "car": "#00b4d8",
+    "truck": "#ff9f1c",
+    "bus": "#f15bb5",
+    "motorcycle": "#9b5de5",
+    "bicycle": "#00f5d4",
+    "pedestrian": "#f9c74f",
+    "emergency_vehicle": "#ef233c",
+    "other": "#ffffff",
+}
+LIGHT_COLORS = {"red": "#ff1744", "yellow": "#ffea00", "green": "#00e676", "off": "#b0bec5", "unknown": "#ffffff"}
 
 SCENE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -153,6 +178,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-images", type=int, help="Optional cap for a directory input.")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate JSON files that already exist.")
     parser.add_argument("--retries", type=int, default=2, help="Retries after a transient API error.")
+    parser.add_argument("--no-visualize", dest="visualize", action="store_false", help="Do not save the overlay image alongside JSON.")
+    parser.add_argument("--visualize-only", action="store_true", help="Render existing JSON annotations without calling Gemini.")
+    parser.set_defaults(visualize=True)
     args = parser.parse_args()
 
     if args.max_images is not None and args.max_images < 1:
@@ -195,6 +223,10 @@ def output_path_for(image_path: Path, input_root: Path, output_dir: Path) -> Pat
         relative_path = image_path.relative_to(input_root)
         return (output_dir / relative_path).with_suffix(".json")
     return output_dir / f"{image_path.stem}.json"
+
+
+def visualization_path_for(annotation_path: Path) -> Path:
+    return annotation_path.with_suffix(".vis.png")
 
 
 def parse_json_response(response_text: str) -> dict[str, Any]:
@@ -241,6 +273,64 @@ def validate_bbox(bbox: Any, label: str) -> None:
         raise ValueError(f"{label} has an invalid box extent: {bbox!r}")
 
 
+def normalized_point_to_pixel(point: list[int], width: int, height: int) -> tuple[int, int]:
+    x, y = point
+    return round(x / COORDINATE_RANGE * width), round(y / COORDINATE_RANGE * height)
+
+
+def normalized_bbox_to_pixels(bbox: list[int], width: int, height: int) -> tuple[int, int, int, int]:
+    ymin, xmin, ymax, xmax = bbox
+    x1, y1 = normalized_point_to_pixel([xmin, ymin], width, height)
+    x2, y2 = normalized_point_to_pixel([xmax, ymax], width, height)
+    return x1, y1, x2, y2
+
+
+def draw_label(draw: ImageDraw.ImageDraw, anchor: tuple[int, int], text: str, color: str, font: ImageFont.ImageFont) -> None:
+    left, top, right, bottom = draw.textbbox(anchor, text, font=font)
+    draw.rectangle((left - 2, top - 2, right + 2, bottom + 2), fill="#000000cc")
+    draw.text(anchor, text, fill=color, font=font)
+
+
+def render_visualization(image_path: Path, annotation: dict[str, Any], output_path: Path) -> None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as error:
+        raise RuntimeError("Missing Pillow. Run: pip install -r requirements_annotation.txt") from error
+
+    image = Image.open(image_path).convert("RGBA")
+    width, height = image.size
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+    line_width = max(2, round(min(width, height) / 480))
+
+    for lane in annotation["lanes"]:
+        color = LANE_COLORS[lane["role"]]
+        points = [normalized_point_to_pixel(point, width, height) for point in lane["centerline_points_2d_1000"]]
+        draw.line(points, fill=color, width=line_width * 2)
+        maneuver = "/".join(lane["allowed_maneuvers"])
+        draw_label(draw, points[0], f"{lane['id']} {maneuver} {lane['confidence']:.2f}", color, font)
+
+    for traffic_light in annotation["traffic_lights"]:
+        color = LIGHT_COLORS[traffic_light["state"]]
+        x1, y1, x2, y2 = normalized_bbox_to_pixels(traffic_light["bbox_2d_1000"], width, height)
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width * 2)
+        lane_ids = ",".join(traffic_light["controlled_lane_ids"]) or "unlinked"
+        draw_label(draw, (x1, max(0, y1 - 12)), f"light:{traffic_light['state']} -> {lane_ids}", color, font)
+
+    for obj in annotation["objects"]:
+        color = OBJECT_COLORS[obj["category"]]
+        x1, y1, x2, y2 = normalized_bbox_to_pixels(obj["bbox_2d_1000"], width, height)
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width * 2)
+        state = "moving" if obj["dynamic"] else "static"
+        draw_label(draw, (x1, max(0, y1 - 12)), f"{obj['category']} {state} {obj['confidence']:.2f}", color, font)
+
+    summary = f"lanes={len(annotation['lanes'])} lights={len(annotation['traffic_lights'])} objects={len(annotation['objects'])}"
+    draw_label(draw, (8, 8), summary, "#ffffff", font)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.alpha_composite(image, overlay).convert("RGB").save(output_path)
+
+
 def annotate_image(client: Any, model: str, image_path: Path, retries: int) -> dict[str, Any]:
     from google.genai import types
 
@@ -265,19 +355,17 @@ def annotate_image(client: Any, model: str, image_path: Path, retries: int) -> d
 
 def main() -> int:
     args = parse_args()
-    api_key = os.environ.get(args.api_key_env)
-    if not api_key:
-        print(f"Set the {args.api_key_env} environment variable before running this script.", file=sys.stderr)
-        return 2
-
-    try:
-        from google import genai
-    except ImportError:
-        print("Missing dependency. Run: pip install -r requirements_annotation.txt", file=sys.stderr)
-        return 2
-
-    client = genai.Client(api_key=api_key)
     if args.list_models:
+        api_key = os.environ.get(args.api_key_env)
+        if not api_key:
+            print(f"Set the {args.api_key_env} environment variable before running this script.", file=sys.stderr)
+            return 2
+        try:
+            from google import genai
+        except ImportError:
+            print("Missing dependency. Run: pip install -r requirements_annotation.txt", file=sys.stderr)
+            return 2
+        client = genai.Client(api_key=api_key)
         for model in client.models.list():
             if model.name and "gemini" in model.name:
                 print(model.name)
@@ -292,16 +380,45 @@ def main() -> int:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
 
+    client = None
+    if not args.visualize_only:
+        api_key = os.environ.get(args.api_key_env)
+        if not api_key:
+            print(f"Set the {args.api_key_env} environment variable before running this script.", file=sys.stderr)
+            return 2
+        try:
+            from google import genai
+        except ImportError:
+            print("Missing dependency. Run: pip install -r requirements_annotation.txt", file=sys.stderr)
+            return 2
+        client = genai.Client(api_key=api_key)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     failures = 0
     for index, image_path in enumerate(images, start=1):
         output_path = output_path_for(image_path, args.input, args.output_dir)
+        visualization_path = visualization_path_for(output_path)
+        if args.visualize_only:
+            if not output_path.exists():
+                failures += 1
+                print(f"[{index}/{len(images)}] Missing annotation JSON: {output_path}", file=sys.stderr)
+                continue
+            try:
+                annotation = json.loads(output_path.read_text(encoding="utf-8"))
+                validate_annotation(annotation)
+                render_visualization(image_path, annotation, visualization_path)
+                print(f"[{index}/{len(images)}] Saved {visualization_path}")
+            except Exception as error:
+                failures += 1
+                print(f"[{index}/{len(images)}] Visualization failed: {error}", file=sys.stderr)
+            continue
         if output_path.exists() and not args.overwrite:
             print(f"[{index}/{len(images)}] Skipping existing {output_path}")
             continue
 
         print(f"[{index}/{len(images)}] Annotating {image_path}")
         try:
+            assert client is not None
             annotation = annotate_image(client, args.model, image_path, args.retries)
             annotation["metadata"] = {
                 "source_image": str(image_path),
@@ -312,6 +429,9 @@ def main() -> int:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(annotation, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             print(f"  Saved {output_path}")
+            if args.visualize:
+                render_visualization(image_path, annotation, visualization_path)
+                print(f"  Saved {visualization_path}")
         except Exception as error:
             failures += 1
             print(f"  Failed: {error}", file=sys.stderr)
