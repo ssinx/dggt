@@ -63,8 +63,8 @@ SCENE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["schema_version", "coordinate_frame", "scene_summary", "lanes", "traffic_lights", "objects", "notes"],
     "properties": {
-        "schema_version": {"type": "string", "enum": ["driving_scene_v2"]},
-        "coordinate_frame": {"type": "string", "enum": ["image_2d_normalized_1000"]},
+        "schema_version": {"type": "string", "enum": ["driving_scene_v3"]},
+        "coordinate_frame": {"type": "string", "enum": ["image_2d_normalized_xy_1000"]},
         "scene_summary": {"type": "string"},
         "lanes": {
             "type": "array",
@@ -146,6 +146,7 @@ SCENE_SCHEMA: dict[str, Any] = {
     "$defs": {
         "point": {
             "type": "array",
+            "description": "[x, y] in normalized image coordinates [0, 1000], where x increases left-to-right and y increases top-to-bottom.",
             "minItems": 2,
             "maxItems": 2,
             "items": {"type": "integer", "minimum": 0, "maximum": COORDINATE_RANGE},
@@ -153,7 +154,7 @@ SCENE_SCHEMA: dict[str, Any] = {
         "polyline": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/point"}},
         "bbox": {
             "type": "array",
-            "description": "[ymin, xmin, ymax, xmax] in normalized image coordinates [0, 1000].",
+            "description": "[xmin, ymin, xmax, ymax] in normalized image coordinates [0, 1000], where x increases left-to-right and y increases top-to-bottom.",
             "minItems": 4,
             "maxItems": 4,
             "items": {"type": "integer", "minimum": 0, "maximum": COORDINATE_RANGE},
@@ -167,8 +168,9 @@ Return only JSON that conforms to the supplied schema.
 Rules:
 - The camera may face forward, rearward, sideways, or obliquely. Its calibration, vehicle-relative orientation, ego pose, and temporal context are unavailable. Do not assume that the camera is forward-facing or that the ego vehicle is visible.
 - This is a 2D image annotation task. Do not infer metric BEV coordinates, 3D boxes, distances, hidden lanes, or ego-frame lane positions.
-- Coordinates use the original image plane, normalized to integers in [0, 1000].
-- A bounding box is exactly [ymin, xmin, ymax, xmax].
+- Coordinates use the original image plane, normalized to integers in [0, 1000]: x increases left-to-right and y increases top-to-bottom.
+- Every lane centerline point is exactly [x, y].
+- Every bounding box is exactly [xmin, ymin, xmax, ymax]. Do not use the [ymin, xmin, ymax, xmax] convention.
 - Annotate each lane as an image-local visible road segment. IDs are unique only within this image. Order its centerline points along the visible segment; do not apply a near/far convention.
 - `image_region` is only left/center/right in the image plane. Never use it to infer left/right of the ego vehicle.
 - `flow_direction_in_image` describes only the projected direction visually suggested in the image. It is not same/opposite direction relative to the ego vehicle. Use `unknown` if lane direction cannot be supported by markings, arrows, or traffic behavior.
@@ -260,9 +262,9 @@ def validate_annotation(annotation: dict[str, Any]) -> None:
     missing_keys = required_keys.difference(annotation)
     if missing_keys:
         raise ValueError(f"Gemini response misses required keys: {sorted(missing_keys)}")
-    if annotation["schema_version"] != "driving_scene_v2":
+    if annotation["schema_version"] != "driving_scene_v3":
         raise ValueError(f"Unexpected schema_version: {annotation['schema_version']!r}")
-    if annotation["coordinate_frame"] != "image_2d_normalized_1000":
+    if annotation["coordinate_frame"] != "image_2d_normalized_xy_1000":
         raise ValueError(f"Unexpected coordinate_frame: {annotation['coordinate_frame']!r}")
     for lane in annotation["lanes"]:
         validate_entity_keys(
@@ -315,7 +317,7 @@ def normalized_point_to_pixel(point: list[int], width: int, height: int) -> tupl
 
 
 def normalized_bbox_to_pixels(bbox: list[int], width: int, height: int) -> tuple[int, int, int, int]:
-    ymin, xmin, ymax, xmax = bbox
+    xmin, ymin, xmax, ymax = bbox
     x1, y1 = normalized_point_to_pixel([xmin, ymin], width, height)
     x2, y2 = normalized_point_to_pixel([xmax, ymax], width, height)
     return x1, y1, x2, y2
@@ -460,7 +462,7 @@ def main() -> int:
             annotation["metadata"] = {
                 "source_image": str(image_path),
                 "model": args.model,
-                "coordinate_system": "2D normalized image coordinates [0, 1000]",
+                "coordinate_system": "2D normalized image coordinates [x, y] in [0, 1000]",
                 "ego_frame_semantics": "not inferred from an arbitrary-orientation single camera image",
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             }
