@@ -40,11 +40,10 @@ if TYPE_CHECKING:
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 COORDINATE_RANGE = 1000
 LANE_COLORS = {
-    "ego": "#00e5ff",
-    "left_of_ego": "#00ff73",
-    "right_of_ego": "#ff9d00",
-    "oncoming": "#ff4d6d",
-    "crossing": "#bd93f9",
+    "toward_image_top": "#00e5ff",
+    "toward_image_bottom": "#00ff73",
+    "left_to_right": "#ff9d00",
+    "right_to_left": "#ff4d6d",
     "unknown": "#ffffff",
 }
 OBJECT_COLORS = {
@@ -62,9 +61,10 @@ LIGHT_COLORS = {"red": "#ff1744", "yellow": "#ffea00", "green": "#00e676", "off"
 SCENE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["schema_version", "scene_summary", "lanes", "traffic_lights", "objects", "notes"],
+    "required": ["schema_version", "coordinate_frame", "scene_summary", "lanes", "traffic_lights", "objects", "notes"],
     "properties": {
-        "schema_version": {"type": "string", "enum": ["driving_scene_v1"]},
+        "schema_version": {"type": "string", "enum": ["driving_scene_v2"]},
+        "coordinate_frame": {"type": "string", "enum": ["image_2d_normalized_1000"]},
         "scene_summary": {"type": "string"},
         "lanes": {
             "type": "array",
@@ -73,23 +73,31 @@ SCENE_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "required": [
                     "id",
-                    "role",
-                    "travel_direction",
-                    "allowed_maneuvers",
+                    "image_region",
+                    "flow_direction_in_image",
+                    "maneuver_indications",
+                    "evidence",
                     "centerline_points_2d_1000",
                     "visibility",
                     "confidence",
                 ],
                 "properties": {
                     "id": {"type": "string"},
-                    "role": {
+                    "image_region": {
                         "type": "string",
-                        "enum": ["ego", "left_of_ego", "right_of_ego", "oncoming", "crossing", "unknown"],
+                        "enum": ["left_image", "center_image", "right_image", "spans_image", "unknown"],
                     },
-                    "travel_direction": {"type": "string", "enum": ["same", "opposite", "crossing", "unknown"]},
-                    "allowed_maneuvers": {
+                    "flow_direction_in_image": {
+                        "type": "string",
+                        "enum": ["toward_image_top", "toward_image_bottom", "left_to_right", "right_to_left", "unknown"],
+                    },
+                    "maneuver_indications": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["left", "right", "straight", "u_turn", "unknown"]},
+                        "items": {"type": "string", "enum": ["left", "right", "straight", "u_turn", "none", "unknown"]},
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["lane_markings", "road_edge", "arrow_marking", "vehicles", "traffic_signal", "other", "unknown"]},
                     },
                     "centerline_points_2d_1000": {"$ref": "#/$defs/polyline"},
                     "visibility": {"type": "string", "enum": ["visible", "partially_occluded", "unknown"]},
@@ -102,12 +110,13 @@ SCENE_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["id", "bbox_2d_1000", "state", "controlled_lane_ids", "visibility", "confidence"],
+                "required": ["id", "bbox_2d_1000", "state", "associated_lane_ids", "association_confidence", "visibility", "confidence"],
                 "properties": {
                     "id": {"type": "string"},
                     "bbox_2d_1000": {"$ref": "#/$defs/bbox"},
                     "state": {"type": "string", "enum": ["red", "yellow", "green", "off", "unknown"]},
-                    "controlled_lane_ids": {"type": "array", "items": {"type": "string"}},
+                    "associated_lane_ids": {"type": "array", "items": {"type": "string"}},
+                    "association_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "visibility": {"type": "string", "enum": ["visible", "partially_occluded", "unknown"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
@@ -118,7 +127,7 @@ SCENE_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["id", "category", "bbox_2d_1000", "dynamic", "visibility", "confidence"],
+                "required": ["id", "category", "bbox_2d_1000", "motion_cue", "visibility", "confidence"],
                 "properties": {
                     "id": {"type": "string"},
                     "category": {
@@ -126,7 +135,7 @@ SCENE_SCHEMA: dict[str, Any] = {
                         "enum": ["car", "truck", "bus", "motorcycle", "bicycle", "pedestrian", "emergency_vehicle", "other"],
                     },
                     "bbox_2d_1000": {"$ref": "#/$defs/bbox"},
-                    "dynamic": {"type": "boolean"},
+                    "motion_cue": {"type": "string", "enum": ["likely_moving", "likely_stationary", "unknown"]},
                     "visibility": {"type": "string", "enum": ["visible", "partially_occluded", "unknown"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
@@ -152,17 +161,22 @@ SCENE_SCHEMA: dict[str, Any] = {
     },
 }
 
-PROMPT = """You annotate a forward-facing driving-scene image for a dataset.
+PROMPT = """You annotate one driving-scene camera image for a dataset.
 Return only JSON that conforms to the supplied schema.
 
 Rules:
-- This is a 2D image annotation task. Do not infer metric BEV coordinates, 3D boxes, distances, or hidden lanes.
+- The camera may face forward, rearward, sideways, or obliquely. Its calibration, vehicle-relative orientation, ego pose, and temporal context are unavailable. Do not assume that the camera is forward-facing or that the ego vehicle is visible.
+- This is a 2D image annotation task. Do not infer metric BEV coordinates, 3D boxes, distances, hidden lanes, or ego-frame lane positions.
 - Coordinates use the original image plane, normalized to integers in [0, 1000].
 - A bounding box is exactly [ymin, xmin, ymax, xmax].
-- Lane centerlines are ordered from image bottom (near) toward image top (far). Include only clearly visible lane segments.
-- `allowed_maneuvers` means the legal or visually indicated outgoing movement. Use `unknown` when evidence is insufficient.
-- Associate a traffic light with a lane only when the association is visually well supported; otherwise emit an empty list.
-- Detect salient traffic participants only. Mark occluded, unreadable, or uncertain content as `unknown` / `partially_occluded` and lower confidence.
+- Annotate each lane as an image-local visible road segment. IDs are unique only within this image. Order its centerline points along the visible segment; do not apply a near/far convention.
+- `image_region` is only left/center/right in the image plane. Never use it to infer left/right of the ego vehicle.
+- `flow_direction_in_image` describes only the projected direction visually suggested in the image. It is not same/opposite direction relative to the ego vehicle. Use `unknown` if lane direction cannot be supported by markings, arrows, or traffic behavior.
+- `maneuver_indications` records only a visible arrow marking or strongly supported lane geometry, expressed relative to travel along that lane. It does not assert a legal permission; use `none` when no maneuver indication is visible and `unknown` when it is unreadable.
+- `evidence` must list the visual cues that support each lane segment.
+- Associate a traffic light with a lane only when the image provides strong evidence that it faces or is relevant to that lane. `associated_lane_ids` is not a claim that the light legally controls the lane; otherwise emit an empty list and association_confidence 0.
+- Detect salient traffic participants only. A single image cannot establish actual motion: use `motion_cue=unknown` unless there is strong visible evidence for likely_moving or likely_stationary.
+- Mark occluded, unreadable, or uncertain content as `unknown` / `partially_occluded` and lower confidence.
 - Do not add prose or Markdown outside the JSON response.
 """
 
@@ -242,17 +256,39 @@ def parse_json_response(response_text: str) -> dict[str, Any]:
 
 
 def validate_annotation(annotation: dict[str, Any]) -> None:
-    required_keys = {"schema_version", "scene_summary", "lanes", "traffic_lights", "objects", "notes"}
+    required_keys = {"schema_version", "coordinate_frame", "scene_summary", "lanes", "traffic_lights", "objects", "notes"}
     missing_keys = required_keys.difference(annotation)
     if missing_keys:
         raise ValueError(f"Gemini response misses required keys: {sorted(missing_keys)}")
-    if annotation["schema_version"] != "driving_scene_v1":
+    if annotation["schema_version"] != "driving_scene_v2":
         raise ValueError(f"Unexpected schema_version: {annotation['schema_version']!r}")
+    if annotation["coordinate_frame"] != "image_2d_normalized_1000":
+        raise ValueError(f"Unexpected coordinate_frame: {annotation['coordinate_frame']!r}")
     for lane in annotation["lanes"]:
+        validate_entity_keys(
+            lane,
+            {"id", "image_region", "flow_direction_in_image", "maneuver_indications", "evidence", "centerline_points_2d_1000", "visibility", "confidence"},
+            "lane",
+        )
         validate_polyline(lane["centerline_points_2d_1000"], f"lane {lane['id']}")
-    for entity_type in ("traffic_lights", "objects"):
-        for entity in annotation[entity_type]:
-            validate_bbox(entity["bbox_2d_1000"], f"{entity_type} {entity['id']}")
+    for traffic_light in annotation["traffic_lights"]:
+        validate_entity_keys(
+            traffic_light,
+            {"id", "bbox_2d_1000", "state", "associated_lane_ids", "association_confidence", "visibility", "confidence"},
+            "traffic_light",
+        )
+        validate_bbox(traffic_light["bbox_2d_1000"], f"traffic_light {traffic_light['id']}")
+    for obj in annotation["objects"]:
+        validate_entity_keys(obj, {"id", "category", "bbox_2d_1000", "motion_cue", "visibility", "confidence"}, "object")
+        validate_bbox(obj["bbox_2d_1000"], f"object {obj['id']}")
+
+
+def validate_entity_keys(entity: Any, required_keys: set[str], label: str) -> None:
+    if not isinstance(entity, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    missing_keys = required_keys.difference(entity)
+    if missing_keys:
+        raise ValueError(f"{label} misses required keys: {sorted(missing_keys)}")
 
 
 def validate_polyline(points: Any, label: str) -> None:
@@ -305,25 +341,26 @@ def render_visualization(image_path: Path, annotation: dict[str, Any], output_pa
     line_width = max(2, round(min(width, height) / 480))
 
     for lane in annotation["lanes"]:
-        color = LANE_COLORS[lane["role"]]
+        color = LANE_COLORS[lane["flow_direction_in_image"]]
         points = [normalized_point_to_pixel(point, width, height) for point in lane["centerline_points_2d_1000"]]
         draw.line(points, fill=color, width=line_width * 2)
-        maneuver = "/".join(lane["allowed_maneuvers"])
-        draw_label(draw, points[0], f"{lane['id']} {maneuver} {lane['confidence']:.2f}", color, font)
+        maneuvers = "/".join(lane["maneuver_indications"])
+        label = f"{lane['id']} {lane['flow_direction_in_image']} {maneuvers} {lane['confidence']:.2f}"
+        draw_label(draw, points[0], label, color, font)
 
     for traffic_light in annotation["traffic_lights"]:
         color = LIGHT_COLORS[traffic_light["state"]]
         x1, y1, x2, y2 = normalized_bbox_to_pixels(traffic_light["bbox_2d_1000"], width, height)
         draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width * 2)
-        lane_ids = ",".join(traffic_light["controlled_lane_ids"]) or "unlinked"
-        draw_label(draw, (x1, max(0, y1 - 12)), f"light:{traffic_light['state']} -> {lane_ids}", color, font)
+        lane_ids = ",".join(traffic_light["associated_lane_ids"]) or "unlinked"
+        label = f"light:{traffic_light['state']} ~ {lane_ids} {traffic_light['association_confidence']:.2f}"
+        draw_label(draw, (x1, max(0, y1 - 12)), label, color, font)
 
     for obj in annotation["objects"]:
         color = OBJECT_COLORS[obj["category"]]
         x1, y1, x2, y2 = normalized_bbox_to_pixels(obj["bbox_2d_1000"], width, height)
         draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width * 2)
-        state = "moving" if obj["dynamic"] else "static"
-        draw_label(draw, (x1, max(0, y1 - 12)), f"{obj['category']} {state} {obj['confidence']:.2f}", color, font)
+        draw_label(draw, (x1, max(0, y1 - 12)), f"{obj['category']} {obj['motion_cue']} {obj['confidence']:.2f}", color, font)
 
     summary = f"lanes={len(annotation['lanes'])} lights={len(annotation['traffic_lights'])} objects={len(annotation['objects'])}"
     draw_label(draw, (8, 8), summary, "#ffffff", font)
@@ -424,6 +461,7 @@ def main() -> int:
                 "source_image": str(image_path),
                 "model": args.model,
                 "coordinate_system": "2D normalized image coordinates [0, 1000]",
+                "ego_frame_semantics": "not inferred from an arbitrary-orientation single camera image",
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             }
             output_path.parent.mkdir(parents=True, exist_ok=True)
