@@ -860,7 +860,7 @@ def main():
                         height_offset = 0
                         for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
                             camera_id = WAYMO_CAMERA_IDS[camera_offset]
-                            render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
+                            render_idx = render_frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset
                             viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
                             Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
                             render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
