@@ -414,7 +414,50 @@ def get_frame_ids_from_image_paths(image_paths):
     return frame_ids
 
 
-def estimate_waymo_rig_translation_scale(scene_dir, image_paths, source_extrinsics):
+def estimate_waymo_multiview_rig_translation_scale(source_extrinsics, camera_to_ego, input_cameras):
+    """Estimate model-units-per-meter from simultaneous input-camera baselines."""
+    if len(input_cameras) < 2 or source_extrinsics.shape[0] % len(input_cameras) != 0:
+        return None
+
+    views = len(input_cameras)
+    scale_estimates = []
+    for source_view_idx, source_camera in enumerate(input_cameras[:-1]):
+        for target_view_idx, target_camera in enumerate(input_cameras[source_view_idx + 1:], source_view_idx + 1):
+            source_camera_to_ego = torch.as_tensor(
+                camera_to_ego[source_camera],
+                device=source_extrinsics.device,
+                dtype=source_extrinsics.dtype,
+            )
+            target_camera_to_ego = torch.as_tensor(
+                camera_to_ego[target_camera],
+                device=source_extrinsics.device,
+                dtype=source_extrinsics.dtype,
+            )
+            metric_baseline = torch.linalg.vector_norm(
+                (torch.linalg.inv(target_camera_to_ego) @ source_camera_to_ego)[:3, 3]
+            )
+            if metric_baseline <= 1e-5:
+                continue
+
+            predicted_source_extrinsics = source_extrinsics[source_view_idx::views]
+            predicted_target_extrinsics = source_extrinsics[target_view_idx::views]
+            predicted_relative_poses = torch.matmul(
+                predicted_target_extrinsics,
+                torch.linalg.inv(predicted_source_extrinsics),
+            )
+            predicted_baselines = torch.linalg.vector_norm(predicted_relative_poses[:, :3, 3], dim=-1)
+            valid = torch.isfinite(predicted_baselines) & (predicted_baselines > 1e-5)
+            if valid.any():
+                scale_estimates.append(predicted_baselines[valid] / metric_baseline)
+
+    if not scale_estimates:
+        return None
+
+    scale = torch.median(torch.cat(scale_estimates)).item()
+    return scale if np.isfinite(scale) and scale > 0 else None
+
+
+def estimate_waymo_temporal_rig_translation_scale(scene_dir, image_paths, source_extrinsics):
     frame_ids = get_frame_ids_from_image_paths(image_paths)
     if len(frame_ids) != source_extrinsics.shape[0]:
         raise ValueError(
@@ -451,6 +494,29 @@ def estimate_waymo_rig_translation_scale(scene_dir, image_paths, source_extrinsi
     if not np.isfinite(rig_translation_scale) or rig_translation_scale <= 0:
         raise ValueError(f"Invalid estimated Waymo rig translation scale: {rig_translation_scale}.")
     return rig_translation_scale
+
+
+def estimate_waymo_rig_translation_scale(
+    scene_dir,
+    image_paths,
+    source_extrinsics,
+    camera_to_ego,
+    input_cameras,
+    temporal_extrinsics=None,
+):
+    """Estimate model-units-per-meter, preferring simultaneous camera baselines."""
+    multiview_scale = estimate_waymo_multiview_rig_translation_scale(
+        source_extrinsics,
+        camera_to_ego,
+        input_cameras,
+    )
+    if multiview_scale is not None:
+        return multiview_scale, "simultaneous multi-camera baselines"
+    temporal_extrinsics = source_extrinsics if temporal_extrinsics is None else temporal_extrinsics
+    return (
+        estimate_waymo_temporal_rig_translation_scale(scene_dir, image_paths, temporal_extrinsics),
+        "ego-motion fallback",
+    )
 
 
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
@@ -789,12 +855,22 @@ def main():
                         find_waymo_image_path(scene_dir, frame_id, reference_camera)
                         for frame_id in reference_frame_ids
                     ]
-                    rig_translation_scale = args.camera_rig_scale or estimate_waymo_rig_translation_scale(
-                        scene_dir,
-                        reference_image_paths,
-                        reference_extrinsic,
+                    if args.camera_rig_scale is not None:
+                        rig_translation_scale = args.camera_rig_scale
+                        rig_translation_scale_source = "--camera_rig_scale"
+                    else:
+                        rig_translation_scale, rig_translation_scale_source = estimate_waymo_rig_translation_scale(
+                            scene_dir,
+                            reference_image_paths,
+                            source_extrinsic,
+                            camera_to_ego,
+                            args.input_camera,
+                            temporal_extrinsics=reference_extrinsic,
+                        )
+                    print(
+                        f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f} "
+                        f"({rig_translation_scale_source})"
                     )
-                    print(f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f}")
                     print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
                     print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, reference_camera)}")
                     print(
