@@ -182,7 +182,7 @@ def load_waymo_comparison_ground_truth(scene_dir, frame_id):
     }
 
 
-def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images, dynamic_mask):
+def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images, dynamic_mask=None):
     """Compose GT, rendered views, and source-camera dynamic mask into one video frame."""
     rendered_images = {
         camera_id: image.detach().cpu().clamp(0, 1)
@@ -192,7 +192,8 @@ def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images,
         camera_id: image.detach().cpu().clamp(0, 1)
         for camera_id, image in ground_truth_images.items()
     }
-    dynamic_mask = dynamic_mask.detach().cpu().sigmoid().clamp(0, 1)
+    if dynamic_mask is not None:
+        dynamic_mask = dynamic_mask.detach().cpu().sigmoid().clamp(0, 1)
 
     for camera_id in WAYMO_COMPARISON_CAMERA_ORDER:
         if rendered_images[camera_id].shape != ground_truth_images[camera_id].shape:
@@ -200,7 +201,7 @@ def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images,
                 f"Rendered and ground-truth sizes differ for camera {camera_id}: "
                 f"{tuple(rendered_images[camera_id].shape)} and {tuple(ground_truth_images[camera_id].shape)}."
             )
-    if dynamic_mask.shape != rendered_images[0].shape[-2:]:
+    if dynamic_mask is not None and dynamic_mask.shape != rendered_images[0].shape[-2:]:
         raise ValueError(
             "Dynamic mask size does not match source camera 0 render: "
             f"{tuple(dynamic_mask.shape)} and {tuple(rendered_images[0].shape[-2:])}."
@@ -235,12 +236,12 @@ def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images,
     def tile_row(images):
         return torch.cat([pad_to_canvas(images[camera_id]) for camera_id in WAYMO_COMPARISON_CAMERA_ORDER], dim=2)
 
-    dynamic_mask = dynamic_mask.unsqueeze(0).expand(3, -1, -1)
     dynamic_tiles = {
         camera_id: torch.zeros_like(ground_truth_images[camera_id])
         for camera_id in WAYMO_COMPARISON_CAMERA_ORDER
     }
-    dynamic_tiles[0] = dynamic_mask
+    if dynamic_mask is not None:
+        dynamic_tiles[0] = dynamic_mask.unsqueeze(0).expand(3, -1, -1)
     return torch.cat(
         [tile_row(ground_truth_images), tile_row(rendered_images), tile_row(dynamic_tiles)],
         dim=1,
@@ -302,11 +303,6 @@ def build_waymo_render_intrinsics(
             image_path = source_image_path
             missing_image_camera_ids.append(camera_id)
         camera_height, camera_width = get_preprocessed_waymo_image_size(image_path)
-        if camera_id == source_camera and (camera_height, camera_width) != (output_height, output_width):
-            raise ValueError(
-                f"Source camera preprocessing size {(camera_height, camera_width)} does not match model input "
-                f"size {(output_height, output_width)}."
-            )
         intrinsic = build_preprocessed_waymo_intrinsic(
             image_path,
             camera_intrinsics[camera_id],
@@ -323,6 +319,40 @@ def build_waymo_render_intrinsics(
             f"{missing_image_camera_ids}."
         )
     return render_intrinsics, render_image_sizes
+
+
+def build_waymo_input_intrinsics(
+    scene_dir,
+    frame_ids,
+    camera_intrinsics,
+    input_cameras,
+    output_height,
+    output_width,
+    device,
+    dtype,
+):
+    """Build calibrated intrinsics for frame-major, multi-camera model inputs."""
+    if len(frame_ids) % len(input_cameras) != 0:
+        raise ValueError(
+            f"Expected a whole number of frames for cameras {input_cameras}, got {len(frame_ids)} image paths."
+        )
+    input_intrinsics = []
+    for input_index, frame_id in enumerate(frame_ids):
+        camera_id = input_cameras[input_index % len(input_cameras)]
+        image_path = find_waymo_image_path(scene_dir, frame_id, camera_id)
+        input_intrinsics.append(
+            torch.as_tensor(
+                build_preprocessed_waymo_intrinsic(
+                    image_path,
+                    camera_intrinsics[camera_id],
+                    output_height,
+                    output_width,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+        )
+    return torch.stack(input_intrinsics, dim=0)
 
 
 def format_camera_fovs(intrinsics, image_sizes):
@@ -488,8 +518,15 @@ def main():
     input_group.add_argument('--image_dir', type=str, help='Path to a processed Waymo-style dataset')
     input_group.add_argument('--plain_image_dir', type=str, help='Directory of ordinary images for unlabelled inference')
     parser.add_argument('--scene_names', type=str, nargs='+', help='Scene names, supports numeric IDs, named directories, or numeric ranges like (3,7)')
-    parser.add_argument('--input_views', type=int, default=1, help='Number of input views')
-    parser.add_argument('--input_camera', type=int, default=0, choices=WAYMO_CAMERA_IDS, help='Waymo camera ID used when --input_views=1')
+    parser.add_argument('--input_views', type=int, help='Deprecated: inferred from --input_camera')
+    parser.add_argument(
+        '--input_camera',
+        type=int,
+        nargs='+',
+        default=None,
+        choices=WAYMO_CAMERA_IDS,
+        help='One or more ordered Waymo camera IDs, for example: --input_camera 1 3 4',
+    )
     parser.add_argument('--sequence_length', type=int, default=4, help='Number of input frames')
     parser.add_argument('--start_idx', type=int, default=0, help='Starting frame index')
     parser.add_argument('--mode', type=int, choices=[1,2,3], required=True, help='Processing mode')
@@ -506,6 +543,18 @@ def main():
     args = parser.parse_args()
 
     plain_image_inference = args.plain_image_dir is not None
+    if args.input_camera is None:
+        if plain_image_inference:
+            args.input_camera = [0]
+        else:
+            parser.error('--input_camera is required with --image_dir')
+    if len(set(args.input_camera)) != len(args.input_camera):
+        parser.error('--input_camera values must be unique')
+    if args.input_views is not None and args.input_views != len(args.input_camera):
+        parser.error('--input_views must equal the number of IDs passed to --input_camera')
+    args.input_views = len(args.input_camera)
+    reference_camera = args.input_camera[0]
+
     if plain_image_inference:
         if args.mode != 2:
             parser.error('--plain_image_dir supports only --mode 2')
@@ -515,14 +564,14 @@ def main():
             parser.error('-metrics requires ground-truth images and is unavailable with --plain_image_dir')
     elif not args.scene_names:
         parser.error('--scene_names is required when using --image_dir')
+    if not plain_image_inference and args.mode == 3 and args.input_views != 1:
+        parser.error('--mode 3 currently supports exactly one input camera')
 
     if args.render_all_cameras:
         if plain_image_inference:
             parser.error('--render_all_cameras requires a processed Waymo dataset passed with --image_dir')
         if args.mode != 2:
             parser.error('--render_all_cameras currently supports only --mode 2')
-        if args.input_views != 1:
-            parser.error('--render_all_cameras requires --input_views 1')
         if args.metrics:
             parser.error('-metrics cannot compare five rendered cameras to one source-camera ground truth')
         if args.camera_rig_scale is not None and args.camera_rig_scale <= 0:
@@ -620,7 +669,8 @@ def main():
                         camera_intrinsics,
                     )
                     frame_ids = get_frame_ids_from_image_paths(batch['image_paths'])
-                    render_intrinsics, render_image_sizes = build_waymo_render_intrinsics(
+                    reference_frame_ids = frame_ids[::args.input_views]
+                    input_intrinsic = build_waymo_input_intrinsics(
                         scene_dir,
                         frame_ids,
                         camera_intrinsics,
@@ -630,7 +680,17 @@ def main():
                         device,
                         intrinsic.dtype,
                     )
-                    intrinsic = render_intrinsics[args.input_camera]
+                    render_intrinsics, render_image_sizes = build_waymo_render_intrinsics(
+                        scene_dir,
+                        reference_frame_ids,
+                        camera_intrinsics,
+                        reference_camera,
+                        H,
+                        W,
+                        device,
+                        intrinsic.dtype,
+                    )
+                    intrinsic = input_intrinsic
 
                 use_depth = True
                 if use_depth:
@@ -705,29 +765,41 @@ def main():
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
                 if args.render_all_cameras:
+                    reference_indices = torch.arange(
+                        0,
+                        source_extrinsic.shape[0],
+                        args.input_views,
+                        device=device,
+                    )
+                    reference_extrinsic = source_extrinsic[reference_indices]
+                    reference_intrinsic = source_intrinsic[reference_indices]
+                    reference_image_paths = [
+                        find_waymo_image_path(scene_dir, frame_id, reference_camera)
+                        for frame_id in reference_frame_ids
+                    ]
                     rig_translation_scale = args.camera_rig_scale or estimate_waymo_rig_translation_scale(
                         scene_dir,
-                        batch['image_paths'],
-                        source_extrinsic,
+                        reference_image_paths,
+                        reference_extrinsic,
                     )
                     print(f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f}")
                     print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
-                    print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, args.input_camera)}")
+                    print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, reference_camera)}")
                     print(
-                        f"Model source FOV for scene {scene_name}: "
-                        f"({torch.rad2deg(2 * torch.atan(W / (2 * model_source_intrinsic[0, 0, 0]))).item():.1f}, "
-                        f"{torch.rad2deg(2 * torch.atan(H / (2 * model_source_intrinsic[0, 1, 1]))).item():.1f})deg"
+                        f"Reference camera {reference_camera} FOV for scene {scene_name}: "
+                        f"({torch.rad2deg(2 * torch.atan(W / (2 * reference_intrinsic[0, 0, 0]))).item():.1f}, "
+                        f"{torch.rad2deg(2 * torch.atan(H / (2 * reference_intrinsic[0, 1, 1]))).item():.1f})deg"
                     )
                     print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, render_image_sizes)}")
                     render_extrinsic, render_intrinsic = build_all_camera_render_poses(
-                        source_extrinsic,
+                        reference_extrinsic,
                         camera_to_ego,
                         render_intrinsics,
-                        args.input_camera,
+                        reference_camera,
                         rig_translation_scale,
                     )
                     frustum_coverage = compute_source_point_frustum_coverage(
-                        point_map,
+                        point_map[:, reference_indices],
                         render_extrinsic,
                         render_intrinsic,
                         render_image_sizes,
@@ -739,7 +811,8 @@ def main():
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
                     origin_intrinsic = intrinsic   
-                for idx in range(dy_map.shape[1]):
+                render_source_indices = reference_indices.tolist() if args.render_all_cameras else range(dy_map.shape[1])
+                for render_frame_idx, idx in enumerate(render_source_indices):
                     if args.mode == 3:
                         I = intervals
                         t0 = timestamps[idx//I]
@@ -751,7 +824,7 @@ def main():
                         )
                         for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
                             camera_id = WAYMO_CAMERA_IDS[camera_offset]
-                            render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
+                            render_idx = render_frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset
                             viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
                             Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
                             render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
@@ -889,7 +962,7 @@ def main():
 
             if args.images or args.render_all_cameras:
                 if args.render_all_cameras:
-                    for frame_idx in range(source_extrinsic.shape[0]):
+                    for frame_idx in range(len(reference_frame_ids)):
                         for camera_id in WAYMO_CAMERA_IDS:
                             rendered = rendered_images_by_camera[camera_id][frame_idx].detach().cpu().clamp(0, 1)
                             camera_out_dir = os.path.join(scene_out_dir, f"camera_{camera_id}")
@@ -897,15 +970,23 @@ def main():
                             T.ToPILImage()(rendered).save(os.path.join(camera_out_dir, f"frame_{frame_idx:04d}.png"))
                     video_path = os.path.join(scene_out_dir, "all_camera_comparison.mp4")
                     with imageio.get_writer(video_path, fps=8, codec="libx264") as writer:
-                        for frame_idx, frame_id in enumerate(frame_ids):
+                        dynamic_mask_camera_index = (
+                            args.input_camera.index(0) if 0 in args.input_camera else None
+                        )
+                        for frame_idx, frame_id in enumerate(reference_frame_ids):
                             ground_truth_images = load_waymo_comparison_ground_truth(scene_dir, frame_id)
+                            dynamic_mask = (
+                                dy_map[0, frame_idx * args.input_views + dynamic_mask_camera_index]
+                                if dynamic_mask_camera_index is not None
+                                else None
+                            )
                             comparison_frame = make_waymo_all_camera_comparison_frame(
                                 {
                                     camera_id: rendered_images_by_camera[camera_id][frame_idx]
                                     for camera_id in WAYMO_CAMERA_IDS
                                 },
                                 ground_truth_images,
-                                dy_map[0, frame_idx],
+                                dynamic_mask,
                             )
                             writer.append_data(comparison_frame.permute(1, 2, 0).mul(255).byte().numpy())
                     print("Saved all-camera comparison video:", video_path)
@@ -918,33 +999,28 @@ def main():
                         image_list.append(rendered.permute(1, 2, 0).numpy())
                     video_path = os.path.join(scene_out_dir, "rendered_video.mp4")
                     imageio.mimwrite(video_path, (np.array(image_list) * 255).astype(np.uint8), fps=8, codec="libx264")
-                elif args.input_views == 3:
-                    T_total = rendered_image.shape[0]
-                    groups = T_total // 3
+                else:
+                    groups = rendered_image.shape[0] // args.input_views
                     video_list = []
-                    for g in range(groups):
-                        idx_center = 3 * g + 0
-                        idx_left = 3 * g + 1
-                        idx_right = 3 * g + 2
-                        center = rendered_image[idx_center].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-                        left = rendered_image[idx_left].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-                        right = rendered_image[idx_right].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-                        H, W = center.shape[0], center.shape[1]
-                        # convert to uint8 HWC
-                        def to_uint8(arr):
-                            a = (arr * 255.0).astype(np.uint8)
-                            if a.ndim == 2:
-                                a = np.stack([a] * 3, axis=-1)
-                            if a.shape[2] == 4:
-                                a = a[:, :, :3]
-                            return a
-                        left_u = to_uint8(left)
-                        center_u = to_uint8(center)
-                        right_u = to_uint8(right)                            
-                        white = np.ones((H,10, 3), dtype=np.uint8) * 255
-                        composed = np.concatenate([left_u, white, center_u, white, right_u], axis=1)
-                        # save image
-                        image_path = os.path.join(scene_out_dir, f"view_{g:04d}.png")
+                    for group_index in range(groups):
+                        views = [
+                            rendered_image[group_index * args.input_views + view_index]
+                            .detach()
+                            .cpu()
+                            .clamp(0, 1)
+                            .permute(1, 2, 0)
+                            .numpy()
+                            for view_index in range(args.input_views)
+                        ]
+                        height = views[0].shape[0]
+                        separator = np.ones((height, 10, 3), dtype=np.uint8) * 255
+                        composed_parts = []
+                        for view_index, view in enumerate(views):
+                            composed_parts.append((view * 255).astype(np.uint8))
+                            if view_index < len(views) - 1:
+                                composed_parts.append(separator)
+                        composed = np.concatenate(composed_parts, axis=1)
+                        image_path = os.path.join(scene_out_dir, f"view_{group_index:04d}.png")
                         Image.fromarray(composed).save(image_path)
                         video_list.append(composed)
                     video_path = os.path.join(scene_out_dir, "rendered_video.mp4")

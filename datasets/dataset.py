@@ -193,7 +193,7 @@ class ImageDirectoryDataset(Dataset):
         }
 
 
-class WaymoOpenDataset(Dataset):
+class LegacyWaymoOpenDataset(Dataset):
     def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2, input_camera=0):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -657,3 +657,173 @@ class WaymoOpenDataset(Dataset):
                     target_depth_data = torch.zeros(len(target_indices) * 3, images.shape[2], images.shape[3])
                 input_dict["gt_depth"] = target_depth_data
             return input_dict
+
+
+class WaymoOpenDataset(Dataset):
+    """Waymo dataset loader with an arbitrary, ordered list of input cameras."""
+
+    def __init__(
+        self,
+        image_dir,
+        scene_names=None,
+        sequence_length=None,
+        start_idx=-1,
+        mode=1,
+        views=1,
+        intervals=2,
+        input_camera=0,
+    ):
+        if sequence_length is None or sequence_length < 1:
+            raise ValueError("sequence_length must be at least 1")
+        input_cameras = (input_camera,) if isinstance(input_camera, int) else tuple(input_camera)
+        if not input_cameras:
+            raise ValueError("At least one input camera must be specified.")
+        if len(set(input_cameras)) != len(input_cameras):
+            raise ValueError(f"Input cameras must be unique, got {input_cameras}.")
+        if any(camera_id not in range(5) for camera_id in input_cameras):
+            raise ValueError(f"Input cameras must be in [0, 4], got {input_cameras}.")
+        if views != len(input_cameras):
+            raise ValueError(
+                f"views ({views}) must equal the number of input cameras ({len(input_cameras)})."
+            )
+
+        self.image_dir = image_dir
+        self.sequence_length = sequence_length
+        self.start_idx = start_idx
+        self.mode = mode
+        self.interval = intervals if mode == 3 else 1
+        self.views = len(input_cameras)
+        self.input_cameras = input_cameras
+        self.input_camera = input_cameras[0]
+        self.scenes = scene_names or [f"{scene_id:03d}" for scene_id in range(99)]
+        self.image_paths = []
+        self.sky_mask_paths = []
+        self.dynamic_mask_path = []
+        self.depth_flow_paths = []
+
+        for scene_name in self.scenes:
+            scene_dir = os.path.join(image_dir, scene_name)
+            images_dir = os.path.join(scene_dir, "images")
+            self.image_paths.append(self._collect_view_paths(images_dir, (".jpg", ".png"), scene_name, "images"))
+            self.sky_mask_paths.append(
+                self._collect_optional_view_paths(
+                    os.path.join(scene_dir, "sky_masks"), (".jpg", ".png"), scene_name, "sky masks"
+                )
+            )
+            self.dynamic_mask_path.append(
+                self._collect_optional_view_paths(
+                    os.path.join(scene_dir, "fine_dynamic_masks", "all"),
+                    (".jpg", ".png"),
+                    scene_name,
+                    "dynamic masks",
+                )
+            )
+            self.depth_flow_paths.append(
+                self._collect_optional_view_paths(
+                    os.path.join(scene_dir, "depth_flows_4"), (".npy",), scene_name, "depth flows"
+                )
+            )
+
+    def _collect_view_paths(self, directory, extensions, scene_name, label):
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f"Missing {label} directory for scene {scene_name}: {directory}")
+        filenames = os.listdir(directory)
+        view_paths = []
+        for camera_id in self.input_cameras:
+            suffixes = tuple(f"_{camera_id}{extension}" for extension in extensions)
+            paths = sorted(
+                os.path.join(directory, filename)
+                for filename in filenames
+                if filename.endswith(suffixes)
+            )
+            if not paths:
+                raise FileNotFoundError(
+                    f"No {label} found for scene {scene_name}, camera {camera_id} in {directory}."
+                )
+            view_paths.append(paths)
+        self._validate_frame_alignment(view_paths, scene_name, label)
+        return view_paths
+
+    def _collect_optional_view_paths(self, directory, extensions, scene_name, label):
+        return [] if not os.path.isdir(directory) else self._collect_view_paths(directory, extensions, scene_name, label)
+
+    @staticmethod
+    def _frame_id(path):
+        return os.path.basename(path).split("_", maxsplit=1)[0]
+
+    def _validate_frame_alignment(self, view_paths, scene_name, label):
+        frame_ids = [[self._frame_id(path) for path in paths] for paths in view_paths]
+        if any(camera_frame_ids != frame_ids[0] for camera_frame_ids in frame_ids[1:]):
+            raise RuntimeError(
+                f"Inconsistent {label} frame IDs across cameras {self.input_cameras} in scene {scene_name}."
+            )
+
+    def _flatten_paths(self, view_paths, indices):
+        return [view_paths[view_index][frame_index] for frame_index in indices for view_index in range(self.views)]
+
+    def __len__(self):
+        return len(self.scenes)
+
+    def __getitem__(self, idx):
+        image_paths = self.image_paths[idx]
+        num_frames = len(image_paths[0])
+        if self.mode == 1:
+            start_idx = random.randint(0, max(1, num_frames - 21))
+            indices = [start_idx] + [start_idx + offset for offset in sorted(random.sample(range(1, 20), self.sequence_length - 1))]
+            target_indices = None
+            intervals = [1 for _ in range(self.sequence_length - 1)]
+        elif self.mode == 2:
+            start_idx = self.start_idx
+            indices = [start_idx + frame_index for frame_index in range(self.sequence_length)]
+            target_indices = None
+            intervals = [1 for _ in range(self.sequence_length - 1)]
+        elif self.mode == 3:
+            start_idx = self.start_idx
+            indices = [start_idx + frame_index * self.interval for frame_index in range(self.sequence_length)]
+            target_indices = [start_idx + frame_index for frame_index in range(self.sequence_length * self.interval - (self.interval - 1))]
+            intervals = self.interval
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}")
+
+        required_indices = indices if target_indices is None else target_indices
+        if min(indices) < 0 or max(required_indices) >= num_frames:
+            raise IndexError(
+                f"Requested frames {min(indices)}..{max(required_indices)} for scene {self.scenes[idx]}, "
+                f"but only 0..{num_frames - 1} are available."
+            )
+
+        sequence_paths = self._flatten_paths(image_paths, indices)
+        images = load_and_preprocess_images(sequence_paths)
+        timestamps = np.repeat(np.asarray(indices, dtype=np.float32) - start_idx, self.views)
+        timestamps = timestamps / max(timestamps[-1], 1.0) * (self.sequence_length / 4)
+
+        sky_mask_paths = self.sky_mask_paths[idx]
+        if not sky_mask_paths:
+            raise FileNotFoundError(f"Missing sky masks for scene {self.scenes[idx]}.")
+        input_dict = {
+            "images": images,
+            "masks": load_and_preprocess_images(self._flatten_paths(sky_mask_paths, indices)),
+            "image_paths": sequence_paths,
+            "timestamps": timestamps,
+            "interval": intervals,
+        }
+
+        dynamic_mask_paths = self.dynamic_mask_path[idx]
+        selected_indices = target_indices if target_indices is not None else indices
+        if dynamic_mask_paths:
+            input_dict["dynamic_mask"] = load_and_preprocess_images(
+                self._flatten_paths(dynamic_mask_paths, selected_indices)
+            )
+
+        if target_indices is not None:
+            input_dict["targets"] = load_and_preprocess_images(self._flatten_paths(image_paths, target_indices))
+            input_dict["target_masks"] = load_and_preprocess_images(self._flatten_paths(sky_mask_paths, target_indices))
+
+        depth_paths = self.depth_flow_paths[idx]
+        if depth_paths:
+            input_dict["gt_depth"] = load_and_preprocess_flow(
+                self._flatten_paths(depth_paths, selected_indices), None, None, images.shape[2], images.shape[3]
+            )
+        else:
+            input_dict["gt_depth"] = torch.zeros(len(selected_indices) * self.views, images.shape[2], images.shape[3])
+        return input_dict
