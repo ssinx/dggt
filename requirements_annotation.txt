@@ -1,0 +1,2 @@
+# Optional dependency for scripts/gemini_scene_annotate.py.
+google-genai>=1.0.0
