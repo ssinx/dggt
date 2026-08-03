@@ -26,7 +26,7 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
 from gsplat.rendering import rasterization
-from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset
+from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset, load_and_preprocess_images
 from utils.interplation import interp_all
 from utils.video_maker import make_comparison_video_quad
 
@@ -36,23 +36,38 @@ OPENCV_TO_WAYMO = np.array(
     dtype=np.float32,
 )
 WAYMO_CAMERA_IDS = (0, 1, 2, 3, 4)
+WAYMO_COMPARISON_CAMERA_ORDER = (3, 1, 0, 2, 4)
+DEFAULT_WAYMO_CAMERA_INTRINSICS = {
+    0: np.array([2056.2823692090583, 2056.2823692090583, 939.5779800048163, 641.1030804525235, 0.030161695455207253, -0.27366348163840665, 0.001099757907898257, -0.0019278126890982551, 0.0], dtype=np.float32),
+    1: np.array([2063.9144000244905, 2063.9144000244905, 978.7598986481419, 639.3123770365744, 0.028426816000167728, -0.3168906331588955, 0.0009645062447413426, 0.0008992608844722939, 0.0], dtype=np.float32),
+    2: np.array([2065.5315047381105, 2065.5315047381105, 932.3535100809372, 645.739378382839, 0.04046903603810112, -0.3500865311278198, -0.00016608180821456998, -0.0006035090111663273, 0.0], dtype=np.float32),
+    3: np.array([2062.2195522170755, 2062.2195522170755, 974.2667860249346, 238.09466189172986, 0.041057267678638515, -0.33001393529516099, 0.0002816406257543573, -0.0002818074981018001, 0.0], dtype=np.float32),
+    4: np.array([2057.3747280824628, 2057.3747280824628, 958.7077423615501, 262.8829315187602, 0.036860040361417955, -0.3123290638079368, 0.001720265718725565, -0.0011633157299501204, 0.0], dtype=np.float32),
+}
+DEFAULT_WAYMO_CAMERA_EXTRINSICS = {
+    0: np.array([[0.9998362731902033, -0.006126490657911932, 0.01702624225551874, 1.538666713905355], [0.006212629204228849, 0.9999681466335748, -0.005010883812664572, -0.02493885762968132], [-0.01699500077951916, 0.005115841126518574, 0.999842486653809, 2.1153399048271977], [0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    1: np.array([[0.7178061976277986, -0.6961137197995401, 0.013414609721087198, 1.4939734510380249], [0.6960062510324471, 0.7179313259630274, 0.012243762686665767, 0.09112245742382508], [-0.01815381973249437, 0.0005480034822642641, 0.9998350556573337, 2.1151088154019067], [0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    2: np.array([[0.719643071473014, 0.6942976091985146, 0.008042359238015363, 1.4892976372888604], [-0.6942355150736363, 0.7196870899331542, -0.009356398558782966, -0.09461793927925179], [-0.012284107266275738, 0.0011499759887574406, 0.9999238862352954, 2.115639662241132], [0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    3: np.array([[0.008863678723313523, -0.9999469878494199, 0.0052399132017394495, 1.432758697942947], [0.9998136741398955, 0.008952114488320716, 0.017101948692201843, 0.11116961823274964], [-0.017147950384013396, 0.005087350691654994, 0.9998400205335688, 2.115181938652384], [0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    4: np.array([[0.005429609317539405, 0.9999852584639241, 0.00004687747692506315, 1.427151747978933], [-0.9998164036504379, 0.0054295539235595745, -0.018376042438339648, -0.11155890913778603], [-0.018376026071035875, 0.00005290586085128549, 0.9998311451774277, 2.1158184977254706], [0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+}
 
 
 def load_waymo_camera_calibrations(calibration_dir):
     """Load raw Waymo camera-to-vehicle transforms and intrinsics."""
     camera_to_ego = {}
     camera_intrinsics = {}
+    fallback_camera_ids = []
     for camera_id in WAYMO_CAMERA_IDS:
         extrinsic_path = os.path.join(calibration_dir, "extrinsics", f"{camera_id}.txt")
         intrinsic_path = os.path.join(calibration_dir, "intrinsics", f"{camera_id}.txt")
-        if not os.path.isfile(extrinsic_path) or not os.path.isfile(intrinsic_path):
-            raise FileNotFoundError(
-                f"Missing Waymo calibration for camera {camera_id} under {calibration_dir}. "
-                "Expected intrinsics/<camera_id>.txt and extrinsics/<camera_id>.txt."
-            )
-
-        extrinsic = np.loadtxt(extrinsic_path, dtype=np.float32)
-        intrinsic = np.loadtxt(intrinsic_path, dtype=np.float32).reshape(-1)
+        if os.path.isfile(extrinsic_path) and os.path.isfile(intrinsic_path):
+            extrinsic = np.loadtxt(extrinsic_path, dtype=np.float32)
+            intrinsic = np.loadtxt(intrinsic_path, dtype=np.float32).reshape(-1)
+        else:
+            extrinsic = DEFAULT_WAYMO_CAMERA_EXTRINSICS[camera_id].copy()
+            intrinsic = DEFAULT_WAYMO_CAMERA_INTRINSICS[camera_id].copy()
+            fallback_camera_ids.append(camera_id)
         if extrinsic.shape != (4, 4):
             raise ValueError(f"Expected a 4x4 extrinsic matrix in {extrinsic_path}, got {extrinsic.shape}.")
         if intrinsic.shape[0] < 4:
@@ -61,6 +76,11 @@ def load_waymo_camera_calibrations(calibration_dir):
         camera_to_ego[camera_id] = extrinsic @ OPENCV_TO_WAYMO
         camera_intrinsics[camera_id] = intrinsic[:4]
 
+    if fallback_camera_ids:
+        print(
+            f"Using built-in scene-150 Waymo calibration fallback for cameras {fallback_camera_ids}; "
+            "rendered geometry is approximate when the current vehicle rig differs."
+        )
     return camera_to_ego, camera_intrinsics
 
 
@@ -152,6 +172,47 @@ def find_waymo_image_path(scene_dir, frame_id, camera_id):
     raise FileNotFoundError(f"Missing image for Waymo frame {frame_id}, camera {camera_id} under {scene_dir}/images.")
 
 
+def load_waymo_comparison_ground_truth(scene_dir, frame_id, output_height, output_width):
+    image_paths = [
+        find_waymo_image_path(scene_dir, frame_id, camera_id)
+        for camera_id in WAYMO_COMPARISON_CAMERA_ORDER
+    ]
+    images = load_and_preprocess_images(image_paths)
+    if images.shape[-2:] != (output_height, output_width):
+        raise ValueError(
+            "Ground-truth images do not match the rendered resolution: "
+            f"got {tuple(images.shape[-2:])}, expected {(output_height, output_width)}."
+        )
+    return images
+
+
+def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images, dynamic_mask):
+    """Compose GT, rendered views, and source-camera dynamic mask into one video frame."""
+    num_cameras = len(WAYMO_COMPARISON_CAMERA_ORDER)
+    if rendered_images.shape[0] != num_cameras:
+        raise ValueError(
+            f"Expected {num_cameras} rendered images, got {rendered_images.shape[0]}."
+        )
+
+    rendered_images = rendered_images.detach().cpu().clamp(0, 1)
+    ground_truth_images = ground_truth_images.detach().cpu().clamp(0, 1)
+    dynamic_mask = dynamic_mask.detach().cpu().sigmoid().clamp(0, 1)
+
+    camera_order = torch.as_tensor(WAYMO_COMPARISON_CAMERA_ORDER, dtype=torch.long)
+    rendered_images = rendered_images[camera_order]
+
+    def tile_row(images):
+        return images.permute(1, 2, 0, 3).reshape(images.shape[1], images.shape[2], -1)
+
+    dynamic_mask = dynamic_mask.unsqueeze(0).expand(3, -1, -1)
+    dynamic_tiles = torch.zeros_like(ground_truth_images)
+    dynamic_tiles[WAYMO_COMPARISON_CAMERA_ORDER.index(0)] = dynamic_mask
+    return torch.cat(
+        [tile_row(ground_truth_images), tile_row(rendered_images), tile_row(dynamic_tiles)],
+        dim=1,
+    )
+
+
 def build_preprocessed_waymo_intrinsic(image_path, raw_intrinsic, output_height, output_width):
     with Image.open(image_path) as image:
         original_width, original_height = image.size
@@ -176,12 +237,27 @@ def build_preprocessed_waymo_intrinsic(image_path, raw_intrinsic, output_height,
     return intrinsic
 
 
-def build_waymo_render_intrinsics(scene_dir, frame_ids, camera_intrinsics, output_height, output_width, device, dtype):
+def build_waymo_render_intrinsics(
+    scene_dir,
+    frame_ids,
+    camera_intrinsics,
+    source_camera,
+    output_height,
+    output_width,
+    device,
+    dtype,
+):
     if len(frame_ids) == 0:
         raise ValueError("At least one Waymo frame is required to build calibrated intrinsics.")
+    source_image_path = find_waymo_image_path(scene_dir, frame_ids[0], source_camera)
     render_intrinsics = {}
+    missing_image_camera_ids = []
     for camera_id in WAYMO_CAMERA_IDS:
-        image_path = find_waymo_image_path(scene_dir, frame_ids[0], camera_id)
+        try:
+            image_path = find_waymo_image_path(scene_dir, frame_ids[0], camera_id)
+        except FileNotFoundError:
+            image_path = source_image_path
+            missing_image_camera_ids.append(camera_id)
         intrinsic = build_preprocessed_waymo_intrinsic(
             image_path,
             camera_intrinsics[camera_id],
@@ -191,6 +267,11 @@ def build_waymo_render_intrinsics(scene_dir, frame_ids, camera_intrinsics, outpu
         render_intrinsics[camera_id] = torch.as_tensor(intrinsic, device=device, dtype=dtype).unsqueeze(0).expand(
             len(frame_ids), -1, -1
         ).clone()
+    if missing_image_camera_ids:
+        print(
+            f"Using source camera {source_camera} image dimensions for missing target camera images "
+            f"{missing_image_camera_ids}."
+        )
     return render_intrinsics
 
 
@@ -492,6 +573,7 @@ def main():
                         scene_dir,
                         frame_ids,
                         camera_intrinsics,
+                        args.input_camera,
                         H,
                         W,
                         device,
@@ -721,6 +803,23 @@ def main():
                             camera_out_dir = os.path.join(scene_out_dir, f"camera_{camera_id}")
                             os.makedirs(camera_out_dir, exist_ok=True)
                             T.ToPILImage()(rendered).save(os.path.join(camera_out_dir, f"frame_{frame_idx:04d}.png"))
+                    video_path = os.path.join(scene_out_dir, "all_camera_comparison.mp4")
+                    with imageio.get_writer(video_path, fps=8, codec="libx264") as writer:
+                        for frame_idx, frame_id in enumerate(frame_ids):
+                            ground_truth_images = load_waymo_comparison_ground_truth(
+                                scene_dir,
+                                frame_id,
+                                rendered_image.shape[-2],
+                                rendered_image.shape[-1],
+                            )
+                            rendered_start = frame_idx * len(WAYMO_CAMERA_IDS)
+                            comparison_frame = make_waymo_all_camera_comparison_frame(
+                                rendered_image[rendered_start:rendered_start + len(WAYMO_CAMERA_IDS)],
+                                ground_truth_images,
+                                dy_map[0, frame_idx],
+                            )
+                            writer.append_data(comparison_frame.permute(1, 2, 0).mul(255).byte().numpy())
+                    print("Saved all-camera comparison video:", video_path)
                 elif args.input_views == 1:
                     image_list = []
                     for i in range(rendered_image.shape[0]):
