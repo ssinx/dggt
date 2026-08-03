@@ -144,10 +144,11 @@ Rules:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create structured Gemini weak labels for driving images.")
-    parser.add_argument("input", type=Path, help="An image file or a directory containing images.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for one JSON file per image.")
-    parser.add_argument("--model", default="gemini-2.5-flash", help="Gemini model name; override if your account uses another model.")
+    parser.add_argument("input", type=Path, nargs="?", help="An image file or a directory containing images.")
+    parser.add_argument("--output-dir", type=Path, help="Directory for one JSON file per image.")
+    parser.add_argument("--model", default="gemini-3.6-flash", help="Gemini model name; override if your account uses another model.")
     parser.add_argument("--api-key-env", default="GEMINI_API_KEY", help="Environment variable containing the API key.")
+    parser.add_argument("--list-models", action="store_true", help="List Gemini models visible to this API key, then exit.")
     parser.add_argument("--recursive", action="store_true", help="Recursively discover images when input is a directory.")
     parser.add_argument("--max-images", type=int, help="Optional cap for a directory input.")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate JSON files that already exist.")
@@ -158,6 +159,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-images must be positive")
     if args.retries < 0:
         parser.error("--retries must be zero or greater")
+    if not args.list_models and args.output_dir is None:
+        parser.error("--output-dir is required unless --list-models is used")
     return args
 
 
@@ -242,11 +245,7 @@ def annotate_image(client: Any, model: str, image_path: Path, retries: int) -> d
     from google.genai import types
 
     image_part = types.Part.from_bytes(data=image_path.read_bytes(), mime_type=image_mime_type(image_path))
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_json_schema=SCENE_SCHEMA,
-        temperature=0.1,
-    )
+    config = types.GenerateContentConfig(response_mime_type="application/json", response_json_schema=SCENE_SCHEMA)
 
     for attempt in range(retries + 1):
         try:
@@ -277,6 +276,16 @@ def main() -> int:
         print("Missing dependency. Run: pip install -r requirements_annotation.txt", file=sys.stderr)
         return 2
 
+    client = genai.Client(api_key=api_key)
+    if args.list_models:
+        for model in client.models.list():
+            if model.name and "gemini" in model.name:
+                print(model.name)
+        return 0
+    if args.input is None:
+        print("Provide an input image/directory, or use --list-models.", file=sys.stderr)
+        return 2
+
     try:
         images = discover_images(args.input, args.recursive, args.max_images)
     except (FileNotFoundError, ValueError) as error:
@@ -284,7 +293,6 @@ def main() -> int:
         return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    client = genai.Client(api_key=api_key)
     failures = 0
     for index, image_path in enumerate(images, start=1):
         output_path = output_path_for(image_path, args.input, args.output_dir)
@@ -307,6 +315,12 @@ def main() -> int:
         except Exception as error:
             failures += 1
             print(f"  Failed: {error}", file=sys.stderr)
+            if "NOT_FOUND" in str(error) or "no longer available" in str(error):
+                print(
+                    f"  Model {args.model!r} is unavailable to this key. "
+                    "Run with --list-models and pass an available ID with --model.",
+                    file=sys.stderr,
+                )
 
     if failures:
         print(f"Completed with {failures} failed image(s).", file=sys.stderr)
