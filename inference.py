@@ -227,8 +227,8 @@ def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images,
             (
                 width_padding // 2,
                 width_padding - width_padding // 2,
-                height_padding // 2,
-                height_padding - height_padding // 2,
+                height_padding,
+                0,
             ),
         )
 
