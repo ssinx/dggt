@@ -141,10 +141,11 @@ def format_camera_rig_directions(camera_to_ego, source_camera):
     return "; ".join(camera_directions)
 
 
-def compute_source_point_frustum_coverage(point_map, render_extrinsic, render_intrinsic, height, width, stride=16):
+def compute_source_point_frustum_coverage(point_map, render_extrinsic, render_intrinsic, image_sizes, stride=16):
     sampled_point_map = point_map[0, :, ::stride, ::stride].reshape(point_map.shape[1], -1, 3)
     coverage = []
     for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
+        height, width = image_sizes[camera_id]
         visible_points = 0
         total_points = 0
         for frame_idx, world_points in enumerate(sampled_point_map):
@@ -172,41 +173,74 @@ def find_waymo_image_path(scene_dir, frame_id, camera_id):
     raise FileNotFoundError(f"Missing image for Waymo frame {frame_id}, camera {camera_id} under {scene_dir}/images.")
 
 
-def load_waymo_comparison_ground_truth(scene_dir, frame_id, output_height, output_width):
-    image_paths = [
-        find_waymo_image_path(scene_dir, frame_id, camera_id)
+def load_waymo_comparison_ground_truth(scene_dir, frame_id):
+    return {
+        camera_id: load_and_preprocess_images([
+            find_waymo_image_path(scene_dir, frame_id, camera_id)
+        ])[0]
         for camera_id in WAYMO_COMPARISON_CAMERA_ORDER
-    ]
-    images = load_and_preprocess_images(image_paths)
-    if images.shape[-2:] != (output_height, output_width):
-        raise ValueError(
-            "Ground-truth images do not match the rendered resolution: "
-            f"got {tuple(images.shape[-2:])}, expected {(output_height, output_width)}."
-        )
-    return images
+    }
 
 
 def make_waymo_all_camera_comparison_frame(rendered_images, ground_truth_images, dynamic_mask):
     """Compose GT, rendered views, and source-camera dynamic mask into one video frame."""
-    num_cameras = len(WAYMO_COMPARISON_CAMERA_ORDER)
-    if rendered_images.shape[0] != num_cameras:
-        raise ValueError(
-            f"Expected {num_cameras} rendered images, got {rendered_images.shape[0]}."
-        )
-
-    rendered_images = rendered_images.detach().cpu().clamp(0, 1)
-    ground_truth_images = ground_truth_images.detach().cpu().clamp(0, 1)
+    rendered_images = {
+        camera_id: image.detach().cpu().clamp(0, 1)
+        for camera_id, image in rendered_images.items()
+    }
+    ground_truth_images = {
+        camera_id: image.detach().cpu().clamp(0, 1)
+        for camera_id, image in ground_truth_images.items()
+    }
     dynamic_mask = dynamic_mask.detach().cpu().sigmoid().clamp(0, 1)
 
-    camera_order = torch.as_tensor(WAYMO_COMPARISON_CAMERA_ORDER, dtype=torch.long)
-    rendered_images = rendered_images[camera_order]
+    for camera_id in WAYMO_COMPARISON_CAMERA_ORDER:
+        if rendered_images[camera_id].shape != ground_truth_images[camera_id].shape:
+            raise ValueError(
+                f"Rendered and ground-truth sizes differ for camera {camera_id}: "
+                f"{tuple(rendered_images[camera_id].shape)} and {tuple(ground_truth_images[camera_id].shape)}."
+            )
+    if dynamic_mask.shape != rendered_images[0].shape[-2:]:
+        raise ValueError(
+            "Dynamic mask size does not match source camera 0 render: "
+            f"{tuple(dynamic_mask.shape)} and {tuple(rendered_images[0].shape[-2:])}."
+        )
+
+    canvas_height = max(
+        image.shape[-2]
+        for images in (rendered_images, ground_truth_images)
+        for image in images.values()
+    )
+    canvas_width = max(
+        image.shape[-1]
+        for images in (rendered_images, ground_truth_images)
+        for image in images.values()
+    )
+
+    def pad_to_canvas(image):
+        height_padding = canvas_height - image.shape[-2]
+        width_padding = canvas_width - image.shape[-1]
+        if height_padding < 0 or width_padding < 0:
+            raise ValueError("Comparison canvas cannot be smaller than an input image.")
+        return F.pad(
+            image,
+            (
+                width_padding // 2,
+                width_padding - width_padding // 2,
+                height_padding // 2,
+                height_padding - height_padding // 2,
+            ),
+        )
 
     def tile_row(images):
-        return images.permute(1, 2, 0, 3).reshape(images.shape[1], images.shape[2], -1)
+        return torch.cat([pad_to_canvas(images[camera_id]) for camera_id in WAYMO_COMPARISON_CAMERA_ORDER], dim=2)
 
     dynamic_mask = dynamic_mask.unsqueeze(0).expand(3, -1, -1)
-    dynamic_tiles = torch.zeros_like(ground_truth_images)
-    dynamic_tiles[WAYMO_COMPARISON_CAMERA_ORDER.index(0)] = dynamic_mask
+    dynamic_tiles = {
+        camera_id: torch.zeros_like(ground_truth_images[camera_id])
+        for camera_id in WAYMO_COMPARISON_CAMERA_ORDER
+    }
+    dynamic_tiles[0] = dynamic_mask
     return torch.cat(
         [tile_row(ground_truth_images), tile_row(rendered_images), tile_row(dynamic_tiles)],
         dim=1,
@@ -237,6 +271,14 @@ def build_preprocessed_waymo_intrinsic(image_path, raw_intrinsic, output_height,
     return intrinsic
 
 
+def get_preprocessed_waymo_image_size(image_path):
+    with Image.open(image_path) as image:
+        original_width, original_height = image.size
+    output_width = 518
+    resized_height = round(original_height * (output_width / original_width) / 14) * 14
+    return min(resized_height, output_width), output_width
+
+
 def build_waymo_render_intrinsics(
     scene_dir,
     frame_ids,
@@ -251,6 +293,7 @@ def build_waymo_render_intrinsics(
         raise ValueError("At least one Waymo frame is required to build calibrated intrinsics.")
     source_image_path = find_waymo_image_path(scene_dir, frame_ids[0], source_camera)
     render_intrinsics = {}
+    render_image_sizes = {}
     missing_image_camera_ids = []
     for camera_id in WAYMO_CAMERA_IDS:
         try:
@@ -258,27 +301,35 @@ def build_waymo_render_intrinsics(
         except FileNotFoundError:
             image_path = source_image_path
             missing_image_camera_ids.append(camera_id)
+        camera_height, camera_width = get_preprocessed_waymo_image_size(image_path)
+        if camera_id == source_camera and (camera_height, camera_width) != (output_height, output_width):
+            raise ValueError(
+                f"Source camera preprocessing size {(camera_height, camera_width)} does not match model input "
+                f"size {(output_height, output_width)}."
+            )
         intrinsic = build_preprocessed_waymo_intrinsic(
             image_path,
             camera_intrinsics[camera_id],
-            output_height,
-            output_width,
+            camera_height,
+            camera_width,
         )
         render_intrinsics[camera_id] = torch.as_tensor(intrinsic, device=device, dtype=dtype).unsqueeze(0).expand(
             len(frame_ids), -1, -1
         ).clone()
+        render_image_sizes[camera_id] = (camera_height, camera_width)
     if missing_image_camera_ids:
         print(
             f"Using source camera {source_camera} image dimensions for missing target camera images "
             f"{missing_image_camera_ids}."
         )
-    return render_intrinsics
+    return render_intrinsics, render_image_sizes
 
 
-def format_camera_fovs(intrinsics, width, height):
+def format_camera_fovs(intrinsics, image_sizes):
     fovs = []
     for camera_id in WAYMO_CAMERA_IDS:
         intrinsic = intrinsics[camera_id][0]
+        height, width = image_sizes[camera_id]
         fov_x = torch.rad2deg(2 * torch.atan(torch.tensor(width, device=intrinsic.device, dtype=intrinsic.dtype) / (2 * intrinsic[0, 0])))
         fov_y = torch.rad2deg(2 * torch.atan(torch.tensor(height, device=intrinsic.device, dtype=intrinsic.dtype) / (2 * intrinsic[1, 1])))
         fovs.append(f"camera_{camera_id}=({fov_x.item():.1f}, {fov_y.item():.1f})deg")
@@ -569,7 +620,7 @@ def main():
                         camera_intrinsics,
                     )
                     frame_ids = get_frame_ids_from_image_paths(batch['image_paths'])
-                    render_intrinsics = build_waymo_render_intrinsics(
+                    render_intrinsics, render_image_sizes = build_waymo_render_intrinsics(
                         scene_dir,
                         frame_ids,
                         camera_intrinsics,
@@ -646,7 +697,11 @@ def main():
                     dynamic_scales.append(dynamic_scale)
                     dynamic_rotations.append(dynamic_rotation)
 
-                chunked_renders, chunked_alphas = [], []
+                if args.render_all_cameras:
+                    camera_renders = {camera_id: [] for camera_id in WAYMO_CAMERA_IDS}
+                    camera_alphas = {camera_id: [] for camera_id in WAYMO_CAMERA_IDS}
+                else:
+                    chunked_renders, chunked_alphas = [], []
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
                 if args.render_all_cameras:
@@ -663,7 +718,7 @@ def main():
                         f"({torch.rad2deg(2 * torch.atan(W / (2 * model_source_intrinsic[0, 0, 0]))).item():.1f}, "
                         f"{torch.rad2deg(2 * torch.atan(H / (2 * model_source_intrinsic[0, 1, 1]))).item():.1f})deg"
                     )
-                    print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, W, H)}")
+                    print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, render_image_sizes)}")
                     render_extrinsic, render_intrinsic = build_all_camera_render_poses(
                         source_extrinsic,
                         camera_to_ego,
@@ -675,8 +730,7 @@ def main():
                         point_map,
                         render_extrinsic,
                         render_intrinsic,
-                        H,
-                        W,
+                        render_image_sizes,
                     )
                     print(
                         f"Source-depth frustum coverage for scene {scene_name}: "
@@ -694,11 +748,13 @@ def main():
                         world_points, rgbs, opacity, scales, rotation = concat_list(
                             [static_points, static_rgbs, static_opacity_, static_scales, static_rotation],
                             [dynamic_points[idx], dynamic_rgbs[idx], dynamic_opacitys[idx], dynamic_scales[idx], dynamic_rotations[idx]]
-                        )   
+                        )
                         for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
+                            camera_id = WAYMO_CAMERA_IDS[camera_offset]
                             render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
                             viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
                             Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
+                            render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
                             renders_chunk, alphas_chunk, _ = rasterization(
                                 means=world_points,
                                 quats=rotation,
@@ -707,12 +763,16 @@ def main():
                                 colors=rgbs,
                                 viewmats=viewmats,
                                 Ks=Ks,
-                                width=W,
-                                height=H,
+                                width=render_width,
+                                height=render_height,
                                 render_mode='RGB+ED',
                             )
-                            chunked_renders.append(renders_chunk)
-                            chunked_alphas.append(alphas_chunk)
+                            if args.render_all_cameras:
+                                camera_renders[camera_id].append(renders_chunk)
+                                camera_alphas[camera_id].append(alphas_chunk)
+                            else:
+                                chunked_renders.append(renders_chunk)
+                                chunked_alphas.append(alphas_chunk)
                     if args.mode == 2:
                         t0 = timestamps[idx]
                         static_opacity_ = alpha_t(gs_timestamps, t0, static_opacity, gamma0 = static_gs_conf)
@@ -726,9 +786,11 @@ def main():
                             world_points, rgbs, opacity, scales, rotation = static_gs_list
                         height_offset = 0
                         for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
+                            camera_id = WAYMO_CAMERA_IDS[camera_offset]
                             render_idx = idx * len(WAYMO_CAMERA_IDS) + camera_offset
                             viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
                             Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
+                            render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
                             renders_chunk, alphas_chunk, _ = rasterization(
                                 means=world_points,
                                 quats=rotation,
@@ -737,53 +799,83 @@ def main():
                                 colors=rgbs,
                                 viewmats=viewmats,
                                 Ks=Ks,
-                                width=W,
-                                height=H,
+                                width=render_width,
+                                height=render_height,
                                 render_mode='RGB+ED',
                             )
-                            chunked_renders.append(renders_chunk)
-                            chunked_alphas.append(alphas_chunk)
-                renders = torch.cat(chunked_renders, dim=0)
-                depth_maps = renders[..., -1]
-                renders = renders[..., :-1]
-                alphas = torch.cat(chunked_alphas, dim=0)
+                            if args.render_all_cameras:
+                                camera_renders[camera_id].append(renders_chunk)
+                                camera_alphas[camera_id].append(alphas_chunk)
+                            else:
+                                chunked_renders.append(renders_chunk)
+                                chunked_alphas.append(alphas_chunk)
                 if args.render_all_cameras:
-                    bg_render = model.sky_model.forward_with_new_pose(
-                        images,
-                        source_extrinsic,
-                        source_intrinsic,
-                        render_extrinsic,
-                        render_intrinsic,
-                    )
-                    bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
-                elif args.mode == 3:
+                    rendered_images_by_camera = {}
+                    coverage = []
+                    for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
+                        foreground = torch.cat(camera_renders[camera_id], dim=0)
+                        alpha = torch.cat(camera_alphas[camera_id], dim=0)
+                        foreground = foreground[..., :-1]
+                        target_extrinsic = render_extrinsic[camera_offset::len(WAYMO_CAMERA_IDS)]
+                        target_intrinsic = render_intrinsic[camera_offset::len(WAYMO_CAMERA_IDS)]
+                        render_height, render_width = render_image_sizes[camera_id]
+                        bg_render = model.sky_model.forward_with_new_pose(
+                            images,
+                            source_extrinsic,
+                            source_intrinsic,
+                            target_extrinsic,
+                            target_intrinsic,
+                            output_height=render_height,
+                            output_width=render_width,
+                        )
+                        bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
+                        if bg_render.shape[0] != foreground.shape[0]:
+                            raise RuntimeError(
+                                f"Foreground and sky render counts differ for camera {camera_id}: "
+                                f"{foreground.shape[0]} and {bg_render.shape[0]}."
+                            )
+                        rendered_images_by_camera[camera_id] = (
+                            alpha * foreground + (1 - alpha) * bg_render
+                        ).permute(0, 3, 1, 2)
+                        coverage.append(f"camera_{camera_id}={alpha.mean().item():.4f}")
+                    print(f"Gaussian alpha coverage for scene {scene_name}: {', '.join(coverage)}")
+                else:
+                    renders = torch.cat(chunked_renders, dim=0)
+                    depth_maps = renders[..., -1]
+                    renders = renders[..., :-1]
+                    alphas = torch.cat(chunked_alphas, dim=0)
+                if not args.render_all_cameras and args.mode == 3:
                     bg_render = model.sky_model.forward_with_new_pose(images,origin_extrinsic,origin_intrinsic, extrinsic, intrinsic)
-                elif args.mode == 2:
+                elif not args.render_all_cameras and args.mode == 2:
                     bg_render = model.sky_model(images, extrinsic, intrinsic)
                     bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)  #
-                if bg_render.shape[0] != renders.shape[0]:
+                if not args.render_all_cameras and bg_render.shape[0] != renders.shape[0]:
                     raise RuntimeError(
                         f"Foreground and sky render counts differ: {renders.shape[0]} and {bg_render.shape[0]}."
                     )
-                if args.render_all_cameras:
-                    coverage = []
-                    for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
-                        camera_alpha = alphas[camera_offset::len(WAYMO_CAMERA_IDS)]
-                        coverage.append(f"camera_{camera_id}={camera_alpha.mean().item():.4f}")
-                    print(f"Gaussian alpha coverage for scene {scene_name}: {', '.join(coverage)}")
-                renders = alphas * renders + (1 - alphas) * bg_render
-                rendered_image = renders.permute(0, 3, 1, 2)
-                target_image = images[0]
+                if not args.render_all_cameras:
+                    renders = alphas * renders + (1 - alphas) * bg_render
+                    rendered_image = renders.permute(0, 3, 1, 2)
+                    target_image = images[0]
 
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
             if args.diffusion:
-                processed_frames = []
-                for i in range(rendered_image.shape[0]):
-                    frame = rendered_image[i].detach().cpu().clamp(0, 1)
-                    processed_frame = process_images_with_difix(frame, "path_to_diffusion_model")
-                    processed_frames.append(processed_frame)
-                rendered_image = torch.stack(processed_frames, dim=0).to(device)
+                if args.render_all_cameras:
+                    for camera_id, camera_images in rendered_images_by_camera.items():
+                        processed_frames = []
+                        for frame in camera_images:
+                            processed_frames.append(
+                                process_images_with_difix(frame.detach().cpu().clamp(0, 1), "path_to_diffusion_model")
+                            )
+                        rendered_images_by_camera[camera_id] = torch.stack(processed_frames, dim=0).to(device)
+                else:
+                    processed_frames = []
+                    for i in range(rendered_image.shape[0]):
+                        frame = rendered_image[i].detach().cpu().clamp(0, 1)
+                        processed_frame = process_images_with_difix(frame, "path_to_diffusion_model")
+                        processed_frames.append(processed_frame)
+                    rendered_image = torch.stack(processed_frames, dim=0).to(device)
             
             if args.metrics:
                 psnr, ssim, lpip = compute_metrics(rendered_image, target_image, loss_fn)
@@ -798,23 +890,20 @@ def main():
             if args.images or args.render_all_cameras:
                 if args.render_all_cameras:
                     for frame_idx in range(source_extrinsic.shape[0]):
-                        for camera_offset, camera_id in enumerate(WAYMO_CAMERA_IDS):
-                            rendered = rendered_image[frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset].detach().cpu().clamp(0, 1)
+                        for camera_id in WAYMO_CAMERA_IDS:
+                            rendered = rendered_images_by_camera[camera_id][frame_idx].detach().cpu().clamp(0, 1)
                             camera_out_dir = os.path.join(scene_out_dir, f"camera_{camera_id}")
                             os.makedirs(camera_out_dir, exist_ok=True)
                             T.ToPILImage()(rendered).save(os.path.join(camera_out_dir, f"frame_{frame_idx:04d}.png"))
                     video_path = os.path.join(scene_out_dir, "all_camera_comparison.mp4")
                     with imageio.get_writer(video_path, fps=8, codec="libx264") as writer:
                         for frame_idx, frame_id in enumerate(frame_ids):
-                            ground_truth_images = load_waymo_comparison_ground_truth(
-                                scene_dir,
-                                frame_id,
-                                rendered_image.shape[-2],
-                                rendered_image.shape[-1],
-                            )
-                            rendered_start = frame_idx * len(WAYMO_CAMERA_IDS)
+                            ground_truth_images = load_waymo_comparison_ground_truth(scene_dir, frame_id)
                             comparison_frame = make_waymo_all_camera_comparison_frame(
-                                rendered_image[rendered_start:rendered_start + len(WAYMO_CAMERA_IDS)],
+                                {
+                                    camera_id: rendered_images_by_camera[camera_id][frame_idx]
+                                    for camera_id in WAYMO_CAMERA_IDS
+                                },
                                 ground_truth_images,
                                 dy_map[0, frame_idx],
                             )

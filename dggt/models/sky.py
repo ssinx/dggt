@@ -227,7 +227,17 @@ class SkyGaussian(nn.Module):
         # return sampled_feat.view(-1,3), proj_mask, background_scale_res
     
 
-    def forward_with_new_pose(self, images, extrinsics, intrinsics, extrinsics_, intrinsics_, downsample=1):
+    def forward_with_new_pose(
+        self,
+        images,
+        extrinsics,
+        intrinsics,
+        extrinsics_,
+        intrinsics_,
+        downsample=1,
+        output_height=None,
+        output_width=None,
+    ):
         S = extrinsics.shape[0]
         intrinsics_4x4 = torch.eye(4).unsqueeze(0).repeat(S, 1, 1).to(device=intrinsics.device)
         intrinsics_4x4[:,:3, :3] = intrinsics
@@ -240,7 +250,8 @@ class SkyGaussian(nn.Module):
                                                                                     )
 
 
-        H, W = images.shape[-2:]
+        H = output_height if output_height is not None else images.shape[-2]
+        W = output_width if output_width is not None else images.shape[-1]
 
         chunk_size = 4 
         chunked_renders = []
