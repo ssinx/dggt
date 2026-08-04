@@ -23,6 +23,7 @@ from third_party.TAPIP3D.utils.inference_utils import load_model, read_video, in
 from dggt.models.vggt import VGGT
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
+from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
 from gsplat.rendering import rasterization
@@ -612,6 +613,12 @@ def main():
     parser.add_argument('--render_all_cameras', action='store_true', help='Render all five Waymo cameras from the selected single-camera input')
     parser.add_argument('--calibration_dir', type=str, help='Optional scene directory containing intrinsics/ and extrinsics/')
     parser.add_argument('--camera_rig_scale', type=float, help='Optional model-units-per-meter scale for Waymo camera rig translations')
+    parser.add_argument('--assets_manifest', type=str, help='JSON manifest of converted external Gaussian assets')
+    parser.add_argument(
+        '--asset_scene_scale',
+        type=float,
+        help='DGGT model-units-per-meter for external assets; overrides scene_units_per_meter in the manifest',
+    )
     args = parser.parse_args()
 
     plain_image_inference = args.plain_image_dir is not None
@@ -642,6 +649,10 @@ def main():
         parser.error('--scene_names is required when using --image_dir')
     if not plain_image_inference and args.mode == 3 and args.input_views != 1:
         parser.error('--mode 3 currently supports exactly one input camera')
+    if args.assets_manifest and args.mode != 2:
+        parser.error('--assets_manifest currently supports only --mode 2')
+    if args.asset_scene_scale is not None and args.asset_scene_scale <= 0:
+        parser.error('--asset_scene_scale must be positive')
 
     if args.render_all_cameras:
         if plain_image_inference:
@@ -657,6 +668,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
     loss_fn = lpips.LPIPS(net='alex').to(device) if args.metrics else None
+    asset_manifest = load_asset_manifest(args.assets_manifest) if args.assets_manifest else None
+    asset_scene_scale = None
+    asset_cache = None
+    if asset_manifest is not None:
+        asset_scene_scale = args.asset_scene_scale or float(asset_manifest.get("scene_units_per_meter", 1.0))
+        if asset_scene_scale <= 0:
+            parser.error('scene_units_per_meter in --assets_manifest must be positive')
+        asset_cache = load_manifest_assets(asset_manifest, device)
+        print(
+            f"Loaded {len(asset_cache)} external Gaussian asset file(s) from {args.assets_manifest} "
+            f"with scene scale {asset_scene_scale:.6f} model-units-per-meter"
+        )
 
     if plain_image_inference:
         dataset = ImageDirectoryDataset(
@@ -945,6 +968,25 @@ def main():
                             )
                         else:
                             world_points, rgbs, opacity, scales, rotation = static_gs_list
+                        if asset_manifest is not None and asset_cache is not None:
+                            frame_assets = get_assets_for_frame(
+                                asset_manifest,
+                                asset_cache,
+                                scene_name,
+                                render_frame_idx,
+                                asset_scene_scale,
+                            )
+                            if frame_assets is not None:
+                                world_points, rgbs, opacity, scales, rotation = concat_list(
+                                    [world_points, rgbs, opacity, scales, rotation],
+                                    [
+                                        frame_assets["means"],
+                                        frame_assets["colors"],
+                                        frame_assets["opacities"],
+                                        frame_assets["scales"],
+                                        frame_assets["quats"],
+                                    ],
+                                )
                         height_offset = 0
                         for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
                             camera_id = WAYMO_CAMERA_IDS[camera_offset]
