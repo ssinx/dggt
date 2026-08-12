@@ -400,6 +400,32 @@ def build_all_camera_render_poses(
     )
 
 
+def build_birds_eye_render_poses(
+    source_extrinsics,
+    source_intrinsics,
+    height,
+):
+    """Build a downward-looking camera from an input camera's predicted coordinates.
+
+    The virtual camera is shifted along the source camera's local up direction
+    and looks along its local down direction. Its image top remains aligned with
+    the source camera's forward direction. ``height`` uses reconstruction units.
+    """
+    if height <= 0:
+        raise ValueError(f"height must be positive, got {height}.")
+
+    device = source_extrinsics.device
+    dtype = source_extrinsics.dtype
+    source_to_birds_eye = torch.eye(4, device=device, dtype=dtype)
+    source_to_birds_eye[:3, :3] = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        device=device,
+        dtype=dtype,
+    )
+    source_to_birds_eye[2, 3] = height
+    return source_to_birds_eye.unsqueeze(0) @ source_extrinsics, source_intrinsics.clone()
+
+
 def get_frame_ids_from_image_paths(image_paths):
     frame_ids = []
     for image_path in image_paths:
@@ -611,6 +637,17 @@ def main():
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
     parser.add_argument('--render_all_cameras', action='store_true', help='Render all five Waymo cameras from the selected single-camera input')
+    parser.add_argument(
+        '--render_birds_eye',
+        action='store_true',
+        help='Render the reconstructed front camera and a virtual camera directly above it',
+    )
+    parser.add_argument(
+        '--birds_eye_height',
+        type=float,
+        default=1.0,
+        help='Virtual bird\'s-eye camera height in predicted reconstruction-coordinate units',
+    )
     parser.add_argument('--calibration_dir', type=str, help='Optional scene directory containing intrinsics/ and extrinsics/')
     parser.add_argument('--camera_rig_scale', type=float, help='Optional model-units-per-meter scale for Waymo camera rig translations')
     parser.add_argument('--assets_manifest', type=str, help='JSON manifest of converted external Gaussian assets')
@@ -663,6 +700,15 @@ def main():
             parser.error('-metrics cannot compare five rendered cameras to one source-camera ground truth')
         if args.camera_rig_scale is not None and args.camera_rig_scale <= 0:
             parser.error('--camera_rig_scale must be positive')
+    if args.render_birds_eye:
+        if args.mode != 2:
+            parser.error('--render_birds_eye currently supports only --mode 2')
+        if args.input_camera != [0]:
+            parser.error('--render_birds_eye requires exactly one front-camera input: --input_camera 0')
+        if args.birds_eye_height <= 0:
+            parser.error('--birds_eye_height must be positive')
+        if args.render_all_cameras:
+            parser.error('--render_birds_eye cannot be combined with --render_all_cameras')
 
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -781,16 +827,17 @@ def main():
                         device,
                         intrinsic.dtype,
                     )
-                    render_intrinsics, render_image_sizes = build_waymo_render_intrinsics(
-                        scene_dir,
-                        reference_frame_ids,
-                        camera_intrinsics,
-                        reference_camera,
-                        H,
-                        W,
-                        device,
-                        intrinsic.dtype,
-                    )
+                    if args.render_all_cameras:
+                        render_intrinsics, render_image_sizes = build_waymo_render_intrinsics(
+                            scene_dir,
+                            reference_frame_ids,
+                            camera_intrinsics,
+                            reference_camera,
+                            H,
+                            W,
+                            device,
+                            intrinsic.dtype,
+                        )
                     intrinsic = input_intrinsic
 
                 use_depth = True
@@ -861,11 +908,14 @@ def main():
                 if args.render_all_cameras:
                     camera_renders = {camera_id: [] for camera_id in WAYMO_CAMERA_IDS}
                     camera_alphas = {camera_id: [] for camera_id in WAYMO_CAMERA_IDS}
+                elif args.render_birds_eye:
+                    source_renders, source_alphas = [], []
+                    birds_eye_renders, birds_eye_alphas = [], []
                 else:
                     chunked_renders, chunked_alphas = [], []
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
-                if args.render_all_cameras:
+                if args.render_all_cameras or args.render_birds_eye:
                     reference_indices = torch.arange(
                         0,
                         source_extrinsic.shape[0],
@@ -874,55 +924,70 @@ def main():
                     )
                     reference_extrinsic = source_extrinsic[reference_indices]
                     reference_intrinsic = source_intrinsic[reference_indices]
-                    reference_image_paths = [
-                        find_waymo_image_path(scene_dir, frame_id, reference_camera)
-                        for frame_id in reference_frame_ids
-                    ]
-                    if args.camera_rig_scale is not None:
-                        rig_translation_scale = args.camera_rig_scale
-                        rig_translation_scale_source = "--camera_rig_scale"
-                    else:
-                        rig_translation_scale, rig_translation_scale_source = estimate_waymo_rig_translation_scale(
-                            scene_dir,
-                            reference_image_paths,
-                            source_extrinsic,
-                            camera_to_ego,
-                            args.input_camera,
-                            temporal_extrinsics=reference_extrinsic,
+                    if args.render_all_cameras:
+                        reference_image_paths = [
+                            find_waymo_image_path(scene_dir, frame_id, reference_camera)
+                            for frame_id in reference_frame_ids
+                        ]
+                        if args.camera_rig_scale is not None:
+                            rig_translation_scale = args.camera_rig_scale
+                            rig_translation_scale_source = "--camera_rig_scale"
+                        else:
+                            rig_translation_scale, rig_translation_scale_source = estimate_waymo_rig_translation_scale(
+                                scene_dir,
+                                reference_image_paths,
+                                source_extrinsic,
+                                camera_to_ego,
+                                args.input_camera,
+                                temporal_extrinsics=reference_extrinsic,
+                            )
+                        print(
+                            f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f} "
+                            f"({rig_translation_scale_source})"
                         )
-                    print(
-                        f"Waymo rig translation scale for scene {scene_name}: {rig_translation_scale:.6f} "
-                        f"({rig_translation_scale_source})"
-                    )
-                    print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
-                    print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, reference_camera)}")
-                    print(
-                        f"Reference camera {reference_camera} FOV for scene {scene_name}: "
-                        f"({torch.rad2deg(2 * torch.atan(W / (2 * reference_intrinsic[0, 0, 0]))).item():.1f}, "
-                        f"{torch.rad2deg(2 * torch.atan(H / (2 * reference_intrinsic[0, 1, 1]))).item():.1f})deg"
-                    )
-                    print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, render_image_sizes)}")
-                    render_extrinsic, render_intrinsic = build_all_camera_render_poses(
-                        reference_extrinsic,
-                        camera_to_ego,
-                        render_intrinsics,
-                        reference_camera,
-                        rig_translation_scale,
-                    )
-                    frustum_coverage = compute_source_point_frustum_coverage(
-                        point_map[:, reference_indices],
-                        render_extrinsic,
-                        render_intrinsic,
-                        render_image_sizes,
-                    )
-                    print(
-                        f"Source-depth frustum coverage for scene {scene_name}: "
-                        + ", ".join(f"camera_{camera_id}={coverage:.4f}" for camera_id, coverage in frustum_coverage)
-                    )
+                        print(f"Waymo calibration file mapping for scene {scene_name}: {canonical_to_stored}")
+                        print(
+                            f"Reference camera {reference_camera} FOV for scene {scene_name}: "
+                            f"({torch.rad2deg(2 * torch.atan(W / (2 * reference_intrinsic[0, 0, 0]))).item():.1f}, "
+                            f"{torch.rad2deg(2 * torch.atan(H / (2 * reference_intrinsic[0, 1, 1]))).item():.1f})deg"
+                        )
+                        print(f"Waymo camera directions for scene {scene_name}: {format_camera_rig_directions(camera_to_ego, reference_camera)}")
+                        print(f"Calibrated camera FOV for scene {scene_name}: {format_camera_fovs(render_intrinsics, render_image_sizes)}")
+                        render_extrinsic, render_intrinsic = build_all_camera_render_poses(
+                            reference_extrinsic,
+                            camera_to_ego,
+                            render_intrinsics,
+                            reference_camera,
+                            rig_translation_scale,
+                        )
+                        frustum_coverage = compute_source_point_frustum_coverage(
+                            point_map[:, reference_indices],
+                            render_extrinsic,
+                            render_intrinsic,
+                            render_image_sizes,
+                        )
+                        print(
+                            f"Source-depth frustum coverage for scene {scene_name}: "
+                            + ", ".join(f"camera_{camera_id}={coverage:.4f}" for camera_id, coverage in frustum_coverage)
+                        )
+                    else:
+                        birds_eye_extrinsic, birds_eye_intrinsic = build_birds_eye_render_poses(
+                            reference_extrinsic,
+                            reference_intrinsic,
+                            args.birds_eye_height,
+                        )
+                        print(
+                            f"Bird's-eye camera for scene {scene_name}: {args.birds_eye_height:.4f} "
+                            "reconstruction units above the front camera, looking down."
+                        )
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
                     origin_intrinsic = intrinsic   
-                render_source_indices = reference_indices.tolist() if args.render_all_cameras else range(dy_map.shape[1])
+                render_source_indices = (
+                    reference_indices.tolist()
+                    if args.render_all_cameras or args.render_birds_eye
+                    else range(dy_map.shape[1])
+                )
                 for render_frame_idx, idx in enumerate(render_source_indices):
                     if args.mode == 3:
                         I = intervals
@@ -987,31 +1052,58 @@ def main():
                                         frame_assets["quats"],
                                     ],
                                 )
-                        height_offset = 0
-                        for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
-                            camera_id = WAYMO_CAMERA_IDS[camera_offset]
-                            render_idx = render_frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset
-                            viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
-                            Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
-                            render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
-                            renders_chunk, alphas_chunk, _ = rasterization(
-                                means=world_points,
-                                quats=rotation,
-                                scales=scales,
-                                opacities=opacity,
-                                colors=rgbs,
-                                viewmats=viewmats,
-                                Ks=Ks,
-                                width=render_width,
-                                height=render_height,
-                                render_mode='RGB+ED',
-                            )
-                            if args.render_all_cameras:
-                                camera_renders[camera_id].append(renders_chunk)
-                                camera_alphas[camera_id].append(alphas_chunk)
-                            else:
-                                chunked_renders.append(renders_chunk)
-                                chunked_alphas.append(alphas_chunk)
+                        if args.render_birds_eye:
+                            for target_name, viewmats, Ks in (
+                                ("source", extrinsic[idx:idx + 1], intrinsic[idx:idx + 1]),
+                                (
+                                    "birds_eye",
+                                    birds_eye_extrinsic[render_frame_idx:render_frame_idx + 1],
+                                    birds_eye_intrinsic[render_frame_idx:render_frame_idx + 1],
+                                ),
+                            ):
+                                renders_chunk, alphas_chunk, _ = rasterization(
+                                    means=world_points,
+                                    quats=rotation,
+                                    scales=scales,
+                                    opacities=opacity,
+                                    colors=rgbs,
+                                    viewmats=viewmats,
+                                    Ks=Ks,
+                                    width=W,
+                                    height=H,
+                                    render_mode='RGB+ED',
+                                )
+                                if target_name == "source":
+                                    source_renders.append(renders_chunk)
+                                    source_alphas.append(alphas_chunk)
+                                else:
+                                    birds_eye_renders.append(renders_chunk)
+                                    birds_eye_alphas.append(alphas_chunk)
+                        else:
+                            for camera_offset in range(len(WAYMO_CAMERA_IDS)) if args.render_all_cameras else (0,):
+                                camera_id = WAYMO_CAMERA_IDS[camera_offset]
+                                render_idx = render_frame_idx * len(WAYMO_CAMERA_IDS) + camera_offset
+                                viewmats = render_extrinsic[render_idx:render_idx + 1] if args.render_all_cameras else extrinsic[idx:idx + 1]
+                                Ks = render_intrinsic[render_idx:render_idx + 1] if args.render_all_cameras else intrinsic[idx:idx + 1]
+                                render_height, render_width = render_image_sizes[camera_id] if args.render_all_cameras else (H, W)
+                                renders_chunk, alphas_chunk, _ = rasterization(
+                                    means=world_points,
+                                    quats=rotation,
+                                    scales=scales,
+                                    opacities=opacity,
+                                    colors=rgbs,
+                                    viewmats=viewmats,
+                                    Ks=Ks,
+                                    width=render_width,
+                                    height=render_height,
+                                    render_mode='RGB+ED',
+                                )
+                                if args.render_all_cameras:
+                                    camera_renders[camera_id].append(renders_chunk)
+                                    camera_alphas[camera_id].append(alphas_chunk)
+                                else:
+                                    chunked_renders.append(renders_chunk)
+                                    chunked_alphas.append(alphas_chunk)
                 if args.render_all_cameras:
                     rendered_images_by_camera = {}
                     coverage = []
@@ -1042,21 +1134,71 @@ def main():
                         ).permute(0, 3, 1, 2)
                         coverage.append(f"camera_{camera_id}={alpha.mean().item():.4f}")
                     print(f"Gaussian alpha coverage for scene {scene_name}: {', '.join(coverage)}")
+                elif args.render_birds_eye:
+                    source_foreground = torch.cat(source_renders, dim=0)[..., :-1]
+                    source_alpha = torch.cat(source_alphas, dim=0)
+                    source_bg_render = model.sky_model(images, source_extrinsic, source_intrinsic)
+                    source_bg_render = (
+                        source_bg_render - source_bg_render.min()
+                    ) / (source_bg_render.max() - source_bg_render.min() + 1e-8)
+                    if source_bg_render.shape[0] != source_foreground.shape[0]:
+                        raise RuntimeError(
+                            "Foreground and sky render counts differ for the source camera: "
+                            f"{source_foreground.shape[0]} and {source_bg_render.shape[0]}."
+                        )
+                    rendered_image = (
+                        source_alpha * source_foreground + (1 - source_alpha) * source_bg_render
+                    ).permute(0, 3, 1, 2)
+
+                    birds_eye_foreground = torch.cat(birds_eye_renders, dim=0)[..., :-1]
+                    birds_eye_alpha = torch.cat(birds_eye_alphas, dim=0)
+                    birds_eye_bg_render = model.sky_model.forward_with_new_pose(
+                        images,
+                        source_extrinsic,
+                        source_intrinsic,
+                        birds_eye_extrinsic,
+                        birds_eye_intrinsic,
+                        output_height=H,
+                        output_width=W,
+                    )
+                    birds_eye_bg_render = (
+                        birds_eye_bg_render - birds_eye_bg_render.min()
+                    ) / (birds_eye_bg_render.max() - birds_eye_bg_render.min() + 1e-8)
+                    if birds_eye_bg_render.shape[0] != birds_eye_foreground.shape[0]:
+                        raise RuntimeError(
+                            "Foreground and sky render counts differ for the bird's-eye camera: "
+                            f"{birds_eye_foreground.shape[0]} and {birds_eye_bg_render.shape[0]}."
+                        )
+                    birds_eye_rendered_image = (
+                        birds_eye_alpha * birds_eye_foreground
+                        + (1 - birds_eye_alpha) * birds_eye_bg_render
+                    ).permute(0, 3, 1, 2)
+                    target_image = images[0]
+                    print(
+                        f"Gaussian alpha coverage for scene {scene_name}: "
+                        f"source={source_alpha.mean().item():.4f}, "
+                        f"birds_eye={birds_eye_alpha.mean().item():.4f}"
+                    )
                 else:
                     renders = torch.cat(chunked_renders, dim=0)
                     depth_maps = renders[..., -1]
                     renders = renders[..., :-1]
                     alphas = torch.cat(chunked_alphas, dim=0)
-                if not args.render_all_cameras and args.mode == 3:
-                    bg_render = model.sky_model.forward_with_new_pose(images,origin_extrinsic,origin_intrinsic, extrinsic, intrinsic)
-                elif not args.render_all_cameras and args.mode == 2:
-                    bg_render = model.sky_model(images, extrinsic, intrinsic)
-                    bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)  #
-                if not args.render_all_cameras and bg_render.shape[0] != renders.shape[0]:
-                    raise RuntimeError(
-                        f"Foreground and sky render counts differ: {renders.shape[0]} and {bg_render.shape[0]}."
-                    )
-                if not args.render_all_cameras:
+                    if args.mode == 3:
+                        bg_render = model.sky_model.forward_with_new_pose(
+                            images,
+                            origin_extrinsic,
+                            origin_intrinsic,
+                            extrinsic,
+                            intrinsic,
+                        )
+                    elif args.mode == 2:
+                        bg_render = model.sky_model(images, extrinsic, intrinsic)
+                        bg_render = (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
+                    if bg_render.shape[0] != renders.shape[0]:
+                        raise RuntimeError(
+                            f"Foreground and sky render counts differ: {renders.shape[0]} and {bg_render.shape[0]}."
+                        )
                     renders = alphas * renders + (1 - alphas) * bg_render
                     rendered_image = renders.permute(0, 3, 1, 2)
                     target_image = images[0]
@@ -1072,6 +1214,17 @@ def main():
                                 process_images_with_difix(frame.detach().cpu().clamp(0, 1), "path_to_diffusion_model")
                             )
                         rendered_images_by_camera[camera_id] = torch.stack(processed_frames, dim=0).to(device)
+                elif args.render_birds_eye:
+                    processed_source_frames, processed_birds_eye_frames = [], []
+                    for source_frame, birds_eye_frame in zip(rendered_image, birds_eye_rendered_image):
+                        processed_source_frames.append(
+                            process_images_with_difix(source_frame.detach().cpu().clamp(0, 1), "path_to_diffusion_model")
+                        )
+                        processed_birds_eye_frames.append(
+                            process_images_with_difix(birds_eye_frame.detach().cpu().clamp(0, 1), "path_to_diffusion_model")
+                        )
+                    rendered_image = torch.stack(processed_source_frames, dim=0).to(device)
+                    birds_eye_rendered_image = torch.stack(processed_birds_eye_frames, dim=0).to(device)
                 else:
                     processed_frames = []
                     for i in range(rendered_image.shape[0]):
@@ -1090,7 +1243,7 @@ def main():
             scene_out_dir = os.path.join(args.output_path, scene_name)
             os.makedirs(scene_out_dir, exist_ok=True)
 
-            if args.images or args.render_all_cameras:
+            if args.images or args.render_all_cameras or args.render_birds_eye:
                 if args.render_all_cameras:
                     for frame_idx in range(len(reference_frame_ids)):
                         for camera_id in WAYMO_CAMERA_IDS:
@@ -1120,6 +1273,28 @@ def main():
                             )
                             writer.append_data(comparison_frame.permute(1, 2, 0).mul(255).byte().numpy())
                     print("Saved all-camera comparison video:", video_path)
+                elif args.render_birds_eye:
+                    for render_name, render_sequence in (
+                        ("source_camera", rendered_image),
+                        ("birds_eye", birds_eye_rendered_image),
+                    ):
+                        render_out_dir = os.path.join(scene_out_dir, render_name)
+                        os.makedirs(render_out_dir, exist_ok=True)
+                        video_frames = []
+                        for frame_idx, rendered in enumerate(render_sequence):
+                            rendered = rendered.detach().cpu().clamp(0, 1)
+                            T.ToPILImage()(rendered).save(
+                                os.path.join(render_out_dir, f"frame_{frame_idx:04d}.png")
+                            )
+                            video_frames.append(rendered.permute(1, 2, 0).numpy())
+                        video_path = os.path.join(scene_out_dir, f"{render_name}_rendered_video.mp4")
+                        imageio.mimwrite(
+                            video_path,
+                            (np.array(video_frames) * 255).astype(np.uint8),
+                            fps=8,
+                            codec="libx264",
+                        )
+                        print(f"Saved {render_name} rendered video:", video_path)
                 elif args.input_views == 1:
                     image_list = []
                     for i in range(rendered_image.shape[0]):
