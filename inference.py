@@ -26,6 +26,7 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
+from dggt.utils.vlm_point_localization import create_qwen_client, localize_points_in_videos
 from gsplat.rendering import rasterization
 from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset, load_and_preprocess_images
 from utils.interplation import interp_all
@@ -656,7 +657,67 @@ def main():
         type=float,
         help='DGGT model-units-per-meter for external assets; overrides scene_units_per_meter in the manifest',
     )
+    vlm_prompt_group = parser.add_mutually_exclusive_group()
+    vlm_prompt_group.add_argument(
+        '--vlm_prompt',
+        type=str,
+        help='Prompt for Qwen point localization on every sampled rendered-video frame',
+    )
+    vlm_prompt_group.add_argument(
+        '--vlm_prompt_file',
+        type=str,
+        help='UTF-8 text file containing the Qwen point-localization prompt',
+    )
+    parser.add_argument('--vlm_model', type=str, default='qwen3.8-max', help='Qwen model used for point localization')
+    parser.add_argument(
+        '--vlm_api_key_env',
+        type=str,
+        default='DASHSCOPE_API_KEY',
+        help='Environment variable containing the Qwen API key',
+    )
+    parser.add_argument(
+        '--vlm_base_url',
+        type=str,
+        default='https://llm-4shz67zjhmfdsgbr.cn-beijing.maas.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1',
+        help='Qwen OpenAI-compatible Responses API base URL',
+    )
+    parser.add_argument('--vlm_frame_stride', type=int, default=10, help='Send every Nth rendered-video frame to Qwen')
+    parser.add_argument('--vlm_retries', type=int, default=2, help='Retries for each Qwen point-localization request')
+    parser.add_argument(
+        '--vlm_enable_thinking',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Enable Qwen reasoning mode for point localization',
+    )
+    parser.add_argument(
+        '--vlm_output_filename',
+        type=str,
+        default='vlm_point_detections.json',
+        help='Per-scene JSON filename for Qwen point-localization results',
+    )
     args = parser.parse_args()
+
+    if args.vlm_prompt_file:
+        try:
+            with open(args.vlm_prompt_file, encoding='utf-8') as prompt_file:
+                args.vlm_prompt = prompt_file.read()
+        except OSError as error:
+            parser.error(f'Cannot read --vlm_prompt_file: {error}')
+    if args.vlm_prompt is not None:
+        if not args.render_birds_eye:
+            parser.error('--vlm_prompt/--vlm_prompt_file requires --render_birds_eye')
+        if not args.vlm_prompt.strip():
+            parser.error('VLM prompt must not be empty')
+        if args.vlm_frame_stride < 1:
+            parser.error('--vlm_frame_stride must be positive')
+        if args.vlm_retries < 0:
+            parser.error('--vlm_retries must be zero or greater')
+        try:
+            args.vlm_client = create_qwen_client(args.vlm_api_key_env, args.vlm_base_url)
+        except (RuntimeError, ValueError) as error:
+            parser.error(str(error))
+    else:
+        args.vlm_client = None
 
     plain_image_inference = args.plain_image_dir is not None
     if args.input_camera is None:
@@ -1274,6 +1335,7 @@ def main():
                             writer.append_data(comparison_frame.permute(1, 2, 0).mul(255).byte().numpy())
                     print("Saved all-camera comparison video:", video_path)
                 elif args.render_birds_eye:
+                    rendered_video_paths = []
                     for render_name, render_sequence in (
                         ("source_camera", rendered_image),
                         ("birds_eye", birds_eye_rendered_image),
@@ -1295,6 +1357,20 @@ def main():
                             codec="libx264",
                         )
                         print(f"Saved {render_name} rendered video:", video_path)
+                        rendered_video_paths.append(video_path)
+                    if args.vlm_client is not None:
+                        vlm_output_path = os.path.join(scene_out_dir, args.vlm_output_filename)
+                        localize_points_in_videos(
+                            client=args.vlm_client,
+                            model=args.vlm_model,
+                            prompt=args.vlm_prompt,
+                            video_paths=rendered_video_paths,
+                            frame_stride=args.vlm_frame_stride,
+                            output_path=vlm_output_path,
+                            retries=args.vlm_retries,
+                            enable_thinking=args.vlm_enable_thinking,
+                        )
+                        print("Saved VLM point-localization results:", vlm_output_path)
                 elif args.input_views == 1:
                     image_list = []
                     for i in range(rendered_image.shape[0]):

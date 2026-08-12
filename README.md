@@ -60,6 +60,18 @@ pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 pip install -r requirements.txt
 ```
 
+If this environment was created before the dependency pins were added, reinstall
+the compatible inference dependencies before running inference:
+
+```bash
+pip install --upgrade --force-reinstall \
+  "numpy<2" \
+  "huggingface_hub==0.26.5" \
+  "transformers==4.46.3" \
+  "diffusers==0.30.3"
+pip check
+```
+
 2. Compile pointops2
 
 ```bash
@@ -84,9 +96,11 @@ You can test existing models on the Waymo Open dataset.
 python inference.py \
     --image_dir /path/to/images \
     --scene_names 3 5 7 \
+    --input_camera 0 \
     --input_views 1 \
     --intervals 2 \
     --sequence_length 4 \
+    --input_frame_stride 1 \
     --start_idx 0 \
     --mode 2 \
     --ckpt_path /path/to/checkpoint.pth \
@@ -101,9 +115,11 @@ python inference.py \
     --mode <mode>: Specifies the processing mode, with acceptable values of 1--train, 2--reconstruction, or 3--interplation (required).
     --ckpt_path <path>: The path to the pre-trained model weights file (required).
     --output_path <path>: The directory where the output results will be saved (required).
-    --input_views <views>: Number of input cameras like 1 or 3(required).
+    --input_camera <ids...>: One or more ordered Waymo camera IDs, for example `--input_camera 1 3 4` (required for `--image_dir`).
+    --input_views <views>: Deprecated compatibility flag; when supplied it must match the number of `--input_camera` IDs.
     --intervals <interval>: The interval of interpolation frames when performing frame interpolation (mode=3), defaulting to 2 (optional).
     --sequence_length <length>: Defines the number of input frames to consider for each inference, defaulting to 4 (optional).
+    --input_frame_stride <stride>: In Waymo reconstruction mode (`--mode 2`), sample each selected camera every `<stride>` frames; default is 1 for consecutive frames.
     --start_idx <index>: Indicates the starting index of the frames to process, defaulting to 0 (optional).
     -images: A flag that, when specified, enables the output of rendered images for each frame (optional).
     -depth: A flag that, when specified, enables the output of depth maps in .npy format for each frame (optional).
@@ -127,6 +143,32 @@ python inference.py \
 ```
 
 This mode predicts poses, depth, and Gaussian attributes from the images themselves. It uses all-zero sky/dynamic masks because no annotations are available, so it does not generate `comparison.mp4` or support `-metrics`. Rendered frames and `rendered_video.mp4` are written to numbered subdirectories under `--output_path`; depth maps are saved when `-depth` is supplied.
+
+### VLM point localization on bird's-eye renders
+
+When `--render_birds_eye` is enabled, inference writes both `source_camera_rendered_video.mp4` and `birds_eye_rendered_video.mp4`. Add `--vlm_prompt` to send frame `0`, `10`, `20`, and so on from each video to Qwen after rendering. The results for each scene are written to `vlm_point_detections.json`. Each detected point includes normalized `[x, y]` coordinates in `[0, 1000]` and converted pixel coordinates with a top-left origin. Every sampled frame is also saved with the returned points, labels, and confidence values drawn on it under `vlm_point_visualizations/`.
+
+Install the optional client dependency and set an API key first:
+
+```bash
+pip install -r requirements_annotation.txt
+export DASHSCOPE_API_KEY='...'
+```
+
+```bash
+python inference.py \
+    --image_dir /path/to/images \
+    --scene_names 3 \
+    --input_camera 0 \
+    --sequence_length 4 \
+    --mode 2 \
+    --ckpt_path /path/to/checkpoint.pth \
+    --output_path /path/to/output \
+    --render_birds_eye \
+    --vlm_prompt 'Find the center point of every orange traffic cone.'
+```
+
+By default, localization uses `qwen3.8-max`, the supplied Qwen OpenAI-compatible endpoint, and `enable_thinking=true`. Use `--vlm_frame_stride` to change the sampling interval, `--vlm_prompt_file` for a longer UTF-8 prompt, `--vlm_model` or `--vlm_base_url` to select the endpoint/model, and `--no-vlm-enable-thinking` to disable reasoning mode.
 
 ### Train
 <!-- You need to further process the training data according to the .md file in the data processing section.  -->

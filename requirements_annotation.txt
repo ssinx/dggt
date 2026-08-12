@@ -1,2 +1,4 @@
-# Optional dependency for scripts/gemini_scene_annotate.py.
+# Optional dependencies for VLM annotation and point localization.
 google-genai>=1.0.0
+openai>=1.0.0
+pillow
