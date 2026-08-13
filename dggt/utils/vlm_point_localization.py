@@ -9,10 +9,191 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import imageio
+import numpy as np
+import torch
 from PIL import Image, ImageDraw
 
 
 COORDINATE_RANGE = 1000
+
+
+def localize_corresponding_points_in_frame_zero(
+    client: Any,
+    model: str,
+    prompt: str,
+    front_frame: Any,
+    birds_eye_frame: Any,
+    front_extrinsic: torch.Tensor,
+    front_intrinsic: torch.Tensor,
+    birds_eye_extrinsic: torch.Tensor,
+    birds_eye_intrinsic: torch.Tensor,
+    output_path: str | Path,
+    retries: int,
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    """Locate corresponding frame-zero points and triangulate their world positions."""
+    front_frame = _ensure_rgb_frame(front_frame)
+    birds_eye_frame = _ensure_rgb_frame(birds_eye_frame)
+    front_height, front_width = front_frame.shape[:2]
+    birds_height, birds_width = birds_eye_frame.shape[:2]
+    front_detections = _request_point_detections(
+        client, model, prompt, front_frame, retries, enable_thinking
+    )
+    front_points = [_to_pixel_coordinates(point, front_width, front_height) for point in front_detections]
+
+    correspondences = []
+    for front_point in front_points:
+        front_pixel = front_point["coordinate_2d_pixels_xy"]
+        line = epipolar_line_from_pixel(
+            front_pixel,
+            front_extrinsic,
+            front_intrinsic,
+            birds_eye_extrinsic,
+            birds_eye_intrinsic,
+        )
+        annotated_birds_eye = _draw_constraint_line(birds_eye_frame, line)
+        bird_prompt = (
+            f"Find the same physical point labeled {front_point['label']!r} that was selected in the front view. "
+            "The valid location is restricted to the red epipolar line drawn on this bird's-eye image. "
+            "Return exactly one point on that red line. Original request: " + prompt
+        )
+        detections = _request_point_detections(
+            client, model, bird_prompt, annotated_birds_eye, retries, enable_thinking
+        )
+        if len(detections) != 1:
+            raise ValueError(
+                f"Expected exactly one bird's-eye correspondence for {front_point['label']!r}, got {len(detections)}."
+            )
+        bird_point = _to_pixel_coordinates(detections[0], birds_width, birds_height)
+        constrained_pixel = project_pixel_to_line(bird_point["coordinate_2d_pixels_xy"], line)
+        bird_point["vlm_coordinate_2d_pixels_xy"] = bird_point["coordinate_2d_pixels_xy"]
+        bird_point["coordinate_2d_pixels_xy"] = [float(value) for value in constrained_pixel]
+        world_point, ray_error = triangulate_pixels(
+            front_pixel,
+            constrained_pixel,
+            front_extrinsic,
+            front_intrinsic,
+            birds_eye_extrinsic,
+            birds_eye_intrinsic,
+        )
+        correspondences.append(
+            {
+                "label": front_point["label"],
+                "front_point": front_point,
+                "birds_eye_point": bird_point,
+                "birds_eye_epipolar_line": [float(value) for value in line],
+                "world_coordinate_xyz": [float(value) for value in world_point],
+                "triangulation_ray_error": float(ray_error),
+            }
+        )
+
+    output_path = Path(output_path)
+    visualization_dir = output_path.parent / "vlm_point_visualizations"
+    _save_point_visualization(front_frame, front_points, visualization_dir / "front_frame_0000.png")
+    _save_constrained_visualization(
+        birds_eye_frame, correspondences, visualization_dir / "birds_eye_frame_0000.png"
+    )
+    results = {
+        "schema_version": "vlm_stereo_point_localization_v1",
+        "prompt": prompt,
+        "frame_index": 0,
+        "coordinate_frame": "dggt_world_xyz",
+        "correspondences": correspondences,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return results
+
+
+def _pixel_ray(pixel: Any, extrinsic: torch.Tensor, intrinsic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    pixel_h = torch.tensor([float(pixel[0]), float(pixel[1]), 1.0], device=extrinsic.device, dtype=extrinsic.dtype)
+    direction_camera = torch.linalg.solve(intrinsic, pixel_h)
+    rotation = extrinsic[:3, :3]
+    origin = -(rotation.transpose(0, 1) @ extrinsic[:3, 3])
+    direction = rotation.transpose(0, 1) @ direction_camera
+    return origin, direction / torch.linalg.vector_norm(direction)
+
+
+def epipolar_line_from_pixel(
+    pixel: Any,
+    source_extrinsic: torch.Tensor,
+    source_intrinsic: torch.Tensor,
+    target_extrinsic: torch.Tensor,
+    target_intrinsic: torch.Tensor,
+) -> np.ndarray:
+    """Return target-image line ax + by + c = 0 for a source pixel."""
+    origin, direction = _pixel_ray(pixel, source_extrinsic, source_intrinsic)
+    depths = torch.tensor([0.1, 1000.0], device=origin.device, dtype=origin.dtype)
+    world_points = origin[None] + depths[:, None] * direction[None]
+    camera_points = world_points @ target_extrinsic[:3, :3].transpose(0, 1) + target_extrinsic[:3, 3]
+    projected = camera_points @ target_intrinsic.transpose(0, 1)
+    projected = projected[:, :2] / projected[:, 2:3]
+    point_a, point_b = projected.detach().cpu().double().numpy()
+    line = np.cross(np.array([*point_a, 1.0]), np.array([*point_b, 1.0]))
+    norm = np.linalg.norm(line[:2])
+    if not np.isfinite(norm) or norm <= 1e-8:
+        raise ValueError("Cannot construct a valid bird's-eye epipolar line for the selected front point.")
+    return line / norm
+
+
+def project_pixel_to_line(pixel: Any, line: Any) -> np.ndarray:
+    line = np.asarray(line, dtype=np.float64)
+    point = np.asarray(pixel, dtype=np.float64)
+    return point - line[:2] * (line[0] * point[0] + line[1] * point[1] + line[2])
+
+
+def triangulate_pixels(
+    source_pixel: Any,
+    target_pixel: Any,
+    source_extrinsic: torch.Tensor,
+    source_intrinsic: torch.Tensor,
+    target_extrinsic: torch.Tensor,
+    target_intrinsic: torch.Tensor,
+) -> tuple[np.ndarray, float]:
+    """Triangulate as the midpoint of the closest points on two camera rays."""
+    origin_a, direction_a = _pixel_ray(source_pixel, source_extrinsic, source_intrinsic)
+    origin_b, direction_b = _pixel_ray(target_pixel, target_extrinsic, target_intrinsic)
+    rhs = origin_b - origin_a
+    system = torch.stack((direction_a, -direction_b), dim=1)
+    distances = torch.linalg.lstsq(system, rhs).solution
+    point_a = origin_a + distances[0] * direction_a
+    point_b = origin_b + distances[1] * direction_b
+    if torch.any(distances <= 0):
+        raise ValueError("Triangulated point lies behind one of the frame-zero cameras.")
+    midpoint = (point_a + point_b) * 0.5
+    return midpoint.detach().cpu().numpy(), torch.linalg.vector_norm(point_a - point_b).item()
+
+
+def _line_segment_in_image(line: Any, width: int, height: int) -> list[tuple[float, float]]:
+    a, b, c = (float(value) for value in line)
+    candidates = []
+    if abs(b) > 1e-8:
+        candidates.extend([(0.0, -c / b), (float(width - 1), -(a * (width - 1) + c) / b)])
+    if abs(a) > 1e-8:
+        candidates.extend([(-c / a, 0.0), (-(b * (height - 1) + c) / a, float(height - 1))])
+    valid = [(x, y) for x, y in candidates if 0 <= x < width and 0 <= y < height]
+    unique = []
+    for point in valid:
+        if not any(np.linalg.norm(np.subtract(point, other)) < 1e-4 for other in unique):
+            unique.append(point)
+    if len(unique) < 2:
+        raise ValueError("The front-view point's epipolar line does not cross the bird's-eye image.")
+    return unique[:2]
+
+
+def _draw_constraint_line(frame: Any, line: Any) -> np.ndarray:
+    image = Image.fromarray(frame.copy())
+    draw = ImageDraw.Draw(image)
+    draw.line(_line_segment_in_image(line, *image.size), fill="#ff1744", width=max(3, min(image.size) // 150))
+    return np.asarray(image)
+
+
+def _save_constrained_visualization(frame: Any, correspondences: list[dict[str, Any]], output_path: Path) -> None:
+    annotated = frame.copy()
+    for correspondence in correspondences:
+        annotated = _draw_constraint_line(annotated, correspondence["birds_eye_epipolar_line"])
+    points = [correspondence["birds_eye_point"] for correspondence in correspondences]
+    _save_point_visualization(annotated, points, output_path)
 
 
 def create_qwen_client(api_key_env: str, base_url: str) -> Any:

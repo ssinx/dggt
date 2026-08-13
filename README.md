@@ -146,7 +146,9 @@ This mode predicts poses, depth, and Gaussian attributes from the images themsel
 
 ### VLM point localization on bird's-eye renders
 
-When `--render_birds_eye` is enabled, inference writes both `source_camera_rendered_video.mp4` and `birds_eye_rendered_video.mp4`. Add `--vlm_prompt` to send frame `0`, `10`, `20`, and so on from each video to Qwen after rendering. The results for each scene are written to `vlm_point_detections.json`. Each detected point includes normalized `[x, y]` coordinates in `[0, 1000]` and converted pixel coordinates with a top-left origin. Every sampled frame is also saved with the returned points, labels, and confidence values drawn on it under `vlm_point_visualizations/`.
+When `--render_birds_eye` is enabled, inference writes both `source_camera_rendered_video.mp4` and `birds_eye_rendered_video.mp4`. Add `--vlm_prompt` together with `--assets_manifest` to place manifest assets from frame-zero correspondences. Qwen first selects points in the front view. Each front-view point defines an epipolar line in the rendered bird's-eye view, and Qwen selects the same physical point only on that line. The two camera rays are triangulated into a DGGT world coordinate, which replaces the corresponding manifest asset's translation in every rendered frame. Assets and localized points are paired in manifest order.
+
+The results for each scene are written to `vlm_point_detections.json`. It records both 2D selections, the bird's-eye epipolar line, the triangulated world coordinate, and the closest-ray error. Frame-zero visualizations are saved under `vlm_point_visualizations/`.
 
 Install the optional client dependency and set an API key first:
 
@@ -165,10 +167,11 @@ python inference.py \
     --ckpt_path /path/to/checkpoint.pth \
     --output_path /path/to/output \
     --render_birds_eye \
+    --assets_manifest assets/scene_assets.json \
     --vlm_prompt 'Find the center point of every orange traffic cone.'
 ```
 
-By default, localization uses `qwen3.8-max`, the supplied Qwen OpenAI-compatible endpoint, and `enable_thinking=true`. Use `--vlm_frame_stride` to change the sampling interval, `--vlm_prompt_file` for a longer UTF-8 prompt, `--vlm_model` or `--vlm_base_url` to select the endpoint/model, and `--no-vlm-enable-thinking` to disable reasoning mode.
+By default, localization uses `qwen3.8-max`, the supplied Qwen OpenAI-compatible endpoint, and `enable_thinking=true`. Use `--vlm_prompt_file` for a longer UTF-8 prompt, `--vlm_model` or `--vlm_base_url` to select the endpoint/model, and `--no-vlm-enable-thinking` to disable reasoning mode.
 
 ### Train
 <!-- You need to further process the training data according to the .md file in the data processing section.  -->

@@ -402,6 +402,7 @@ def get_assets_for_frame(
     scene_name: str,
     frame_index: int,
     scene_units_per_meter: float,
+    placement_points_world: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return all configured external assets that should be rendered in one frame."""
     transformed_assets = []
@@ -412,6 +413,13 @@ def get_assets_for_frame(
         transform = _asset_transform_for_frame(spec, frame_index, asset["means"].device)
         if transform is None:
             continue
+        if placement_points_world is not None and spec["id"] in placement_points_world:
+            transform = transform.clone()
+            transform[:3, 3] = torch.as_tensor(
+                placement_points_world[spec["id"]],
+                device=transform.device,
+                dtype=transform.dtype,
+            ) / float(scene_units_per_meter)
         transformed = transform_asset_gaussians(
             asset,
             transform,
