@@ -38,7 +38,13 @@ def localize_corresponding_points_in_frame(
     front_height, front_width = front_frame.shape[:2]
     birds_height, birds_width = birds_eye_frame.shape[:2]
     front_detections = _request_point_detections(
-        client, model, prompt, front_frame, retries, enable_thinking
+        client,
+        model,
+        prompt,
+        front_frame,
+        retries,
+        enable_thinking,
+        selection_mode="empty_placement_point",
     )
     front_points = [_to_pixel_coordinates(point, front_width, front_height) for point in front_detections]
 
@@ -54,12 +60,19 @@ def localize_corresponding_points_in_frame(
         )
         annotated_birds_eye = _draw_constraint_line(birds_eye_frame, line)
         bird_prompt = (
-            f"Find the same physical point labeled {front_point['label']!r} that was selected in the front view. "
+            f"Find the same EMPTY PLACEMENT POINT labeled {front_point['label']!r} that was selected in the front view. "
+            "This is a vacant ground location where a new asset will be inserted, not the location of an existing object. "
             "The valid location is restricted to the red epipolar line drawn on this bird's-eye image. "
             "Return exactly one point on that red line. Original request: " + prompt
         )
         detections = _request_point_detections(
-            client, model, bird_prompt, annotated_birds_eye, retries, enable_thinking
+            client,
+            model,
+            bird_prompt,
+            annotated_birds_eye,
+            retries,
+            enable_thinking,
+            selection_mode="empty_placement_point",
         )
         if len(detections) != 1:
             raise ValueError(
@@ -446,12 +459,33 @@ def _request_point_detections(
     frame: Any,
     retries: int,
     enable_thinking: bool,
+    selection_mode: str = "visible_object_or_feature",
 ) -> list[dict[str, Any]]:
     image_data_url = _frame_to_png_data_url(frame)
+    if selection_mode == "empty_placement_point":
+        task_instruction = (
+            "This is an ASSET INSERTION placement task, not an object-detection task. Infer how many new "
+            "objects the user asks to add, and return exactly one placement point for each requested new object. "
+            "Each returned point must be a currently EMPTY, visible ground contact location where the new object "
+            "can be placed. NEVER return the center, wheels, footprint, or any point belonging to an existing "
+            "vehicle, person, or obstacle. Existing objects may only be used as context for understanding roads, "
+            "lanes, spacing, and alignment. Put the point on the supporting road/ground surface, approximately at "
+            "the center of the future asset's ground footprint. The label must describe the vacant placement "
+            "location (for example, 'empty parking position on the left roadside'), not an existing object's "
+            "appearance or color. If no safe visible empty location satisfies the request, return an empty list. "
+            "In Chinese: 请选择一个可添加新物体的空置地面点，绝对不要选择画面中已有物体上的点。"
+        )
+    elif selection_mode == "visible_object_or_feature":
+        task_instruction = (
+            "Find every visible point that satisfies the user's request. For each result, return the center of "
+            "the matched object or the exact requested feature point. Do not infer occluded or off-image locations."
+        )
+    else:
+        raise ValueError(f"Unknown VLM point selection mode: {selection_mode}")
     instruction = (
-        "You locate visual points in one rendered driving-scene image. Find every visible point that "
-        "satisfies the user's request. For each result, return the center of the matched object or the "
-        "exact requested feature point. Coordinates are image-plane [x, y] integers normalized to [0, 1000], "
+        "You locate visual points in one rendered driving-scene image. "
+        + task_instruction
+        + " Coordinates are image-plane [x, y] integers normalized to [0, 1000], "
         "where [0, 0] is the top-left corner. Do not infer occluded or off-image locations. "
         "Return only a JSON object in this exact format, with no Markdown or explanation: "
         '{"coordinate_frame":"image_2d_normalized_xy_1000","points":['
