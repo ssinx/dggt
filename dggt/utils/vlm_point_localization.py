@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw
 COORDINATE_RANGE = 1000
 
 
-def localize_corresponding_points_in_frame_zero(
+def localize_corresponding_points_in_frame(
     client: Any,
     model: str,
     prompt: str,
@@ -28,10 +28,11 @@ def localize_corresponding_points_in_frame_zero(
     birds_eye_extrinsic: torch.Tensor,
     birds_eye_intrinsic: torch.Tensor,
     output_path: str | Path,
+    frame_index: int,
     retries: int,
     enable_thinking: bool,
 ) -> dict[str, Any]:
-    """Locate corresponding frame-zero points and triangulate their world positions."""
+    """Locate corresponding points in one frame and triangulate their world positions."""
     front_frame = _ensure_rgb_frame(front_frame)
     birds_eye_frame = _ensure_rgb_frame(birds_eye_frame)
     front_height, front_width = front_frame.shape[:2]
@@ -89,14 +90,21 @@ def localize_corresponding_points_in_frame_zero(
 
     output_path = Path(output_path)
     visualization_dir = output_path.parent / "vlm_point_visualizations"
-    _save_point_visualization(front_frame, front_points, visualization_dir / "front_frame_0000.png")
+    frame_suffix = f"{frame_index:04d}"
+    _save_point_visualization(
+        front_frame,
+        front_points,
+        visualization_dir / f"front_frame_{frame_suffix}.png",
+    )
     _save_constrained_visualization(
-        birds_eye_frame, correspondences, visualization_dir / "birds_eye_frame_0000.png"
+        birds_eye_frame,
+        correspondences,
+        visualization_dir / f"birds_eye_frame_{frame_suffix}.png",
     )
     results = {
         "schema_version": "vlm_stereo_point_localization_v1",
         "prompt": prompt,
-        "frame_index": 0,
+        "frame_index": frame_index,
         "coordinate_frame": "dggt_world_xyz",
         "correspondences": correspondences,
     }
@@ -159,7 +167,7 @@ def triangulate_pixels(
     point_a = origin_a + distances[0] * direction_a
     point_b = origin_b + distances[1] * direction_b
     if torch.any(distances <= 0):
-        raise ValueError("Triangulated point lies behind one of the frame-zero cameras.")
+        raise ValueError("Triangulated point lies behind one of the selected-frame cameras.")
     midpoint = (point_a + point_b) * 0.5
     return midpoint.detach().cpu().numpy(), torch.linalg.vector_norm(point_a - point_b).item()
 

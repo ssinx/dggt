@@ -26,7 +26,7 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
-from dggt.utils.vlm_point_localization import create_qwen_client, localize_corresponding_points_in_frame_zero
+from dggt.utils.vlm_point_localization import create_qwen_client, localize_corresponding_points_in_frame
 from gsplat.rendering import rasterization
 from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset, load_and_preprocess_images
 from utils.interplation import interp_all
@@ -661,7 +661,7 @@ def main():
     vlm_prompt_group.add_argument(
         '--vlm_prompt',
         type=str,
-        help='Prompt for Qwen point localization in the front and bird\'s-eye views of frame zero',
+        help='Prompt for Qwen point localization in the front and bird\'s-eye views of the last frame',
     )
     vlm_prompt_group.add_argument(
         '--vlm_prompt_file',
@@ -1042,7 +1042,8 @@ def main():
                             "reconstruction units above the front camera, looking down."
                         )
                         if args.vlm_client is not None:
-                            localization_idx = int(reference_indices[0].item())
+                            localization_frame_idx = len(reference_indices) - 1
+                            localization_idx = int(reference_indices[-1].item())
                             localization_t0 = timestamps[localization_idx]
                             localization_static_opacity = alpha_t(
                                 gs_timestamps,
@@ -1070,7 +1071,10 @@ def main():
                             localization_alphas = []
                             for localization_extrinsic, localization_intrinsic in (
                                 (extrinsic[localization_idx:localization_idx + 1], intrinsic[localization_idx:localization_idx + 1]),
-                                (birds_eye_extrinsic[:1], birds_eye_intrinsic[:1]),
+                                (
+                                    birds_eye_extrinsic[localization_frame_idx:localization_frame_idx + 1],
+                                    birds_eye_intrinsic[localization_frame_idx:localization_frame_idx + 1],
+                                ),
                             ):
                                 localization_render, localization_alpha, _ = rasterization(
                                     means=localization_world_points,
@@ -1094,8 +1098,8 @@ def main():
                                 images,
                                 source_extrinsic,
                                 source_intrinsic,
-                                birds_eye_extrinsic[:1],
-                                birds_eye_intrinsic[:1],
+                                birds_eye_extrinsic[localization_frame_idx:localization_frame_idx + 1],
+                                birds_eye_intrinsic[localization_frame_idx:localization_frame_idx + 1],
                                 output_height=H,
                                 output_width=W,
                             )
@@ -1113,7 +1117,7 @@ def main():
 
                             scene_out_dir = os.path.join(args.output_path, scene_name)
                             localization_output_path = os.path.join(scene_out_dir, args.vlm_output_filename)
-                            localization = localize_corresponding_points_in_frame_zero(
+                            localization = localize_corresponding_points_in_frame(
                                 client=args.vlm_client,
                                 model=args.vlm_model,
                                 prompt=args.vlm_prompt,
@@ -1121,9 +1125,10 @@ def main():
                                 birds_eye_frame=localization_frames[1],
                                 front_extrinsic=extrinsic[localization_idx],
                                 front_intrinsic=intrinsic[localization_idx],
-                                birds_eye_extrinsic=birds_eye_extrinsic[0],
-                                birds_eye_intrinsic=birds_eye_intrinsic[0],
+                                birds_eye_extrinsic=birds_eye_extrinsic[localization_frame_idx],
+                                birds_eye_intrinsic=birds_eye_intrinsic[localization_frame_idx],
                                 output_path=localization_output_path,
+                                frame_index=localization_frame_idx,
                                 retries=args.vlm_retries,
                                 enable_thinking=args.vlm_enable_thinking,
                             )
@@ -1135,20 +1140,23 @@ def main():
                                     or target_scenes == scene_name
                                     or isinstance(target_scenes, list) and scene_name in {str(name) for name in target_scenes}
                                 )
-                                active_in_frame_zero = (
-                                    int(spec["start_frame"]) <= 0
-                                    and (spec["end_frame"] is None or int(spec["end_frame"]) >= 0)
+                                active_in_localization_frame = (
+                                    int(spec["start_frame"]) <= localization_frame_idx
+                                    and (
+                                        spec["end_frame"] is None
+                                        or int(spec["end_frame"]) >= localization_frame_idx
+                                    )
                                     and (
                                         spec.get("frame_transforms") is None
-                                        or "0" in spec["frame_transforms"]
+                                        or str(localization_frame_idx) in spec["frame_transforms"]
                                     )
                                 )
-                                if matches_scene and active_in_frame_zero:
+                                if matches_scene and active_in_localization_frame:
                                     matching_asset_specs.append(spec)
                             correspondences = localization["correspondences"]
                             if len(correspondences) != len(matching_asset_specs):
                                 raise ValueError(
-                                    f"Frame-zero localization found {len(correspondences)} point(s), but scene "
+                                    f"Last-frame localization found {len(correspondences)} point(s), but scene "
                                     f"{scene_name} has {len(matching_asset_specs)} manifest asset(s)."
                                 )
                             localized_asset_points = {
@@ -1160,7 +1168,7 @@ def main():
                                 for spec, correspondence in zip(matching_asset_specs, correspondences)
                             }
                             print(
-                                f"Localized {len(localized_asset_points)} frame-zero asset placement point(s) "
+                                f"Localized {len(localized_asset_points)} last-frame asset placement point(s) "
                                 f"for scene {scene_name}: {localization_output_path}"
                             )
                 if args.mode == 3:

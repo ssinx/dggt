@@ -146,9 +146,9 @@ This mode predicts poses, depth, and Gaussian attributes from the images themsel
 
 ### VLM point localization on bird's-eye renders
 
-When `--render_birds_eye` is enabled, inference writes both `source_camera_rendered_video.mp4` and `birds_eye_rendered_video.mp4`. Add `--vlm_prompt` together with `--assets_manifest` to place manifest assets from frame-zero correspondences. Qwen first selects points in the front view. Each front-view point defines an epipolar line in the rendered bird's-eye view, and Qwen selects the same physical point only on that line. The two camera rays are triangulated into a DGGT world coordinate, which replaces the corresponding manifest asset's translation in every rendered frame. Assets and localized points are paired in manifest order.
+When `--render_birds_eye` is enabled, inference writes both `source_camera_rendered_video.mp4` and `birds_eye_rendered_video.mp4`. Add `--vlm_prompt` together with `--assets_manifest` to place manifest assets from the last-frame correspondences. Qwen first selects points in the last front-view frame. Each front-view point defines an epipolar line in the corresponding rendered bird's-eye frame, and Qwen selects the same physical point only on that line. The two camera rays are triangulated into a DGGT world coordinate, which replaces the corresponding manifest asset's translation in every rendered frame. Assets and localized points are paired in manifest order.
 
-The results for each scene are written to `vlm_point_detections.json`. It records both 2D selections, the bird's-eye epipolar line, the triangulated world coordinate, and the closest-ray error. Frame-zero visualizations are saved under `vlm_point_visualizations/`.
+The results for each scene are written to `vlm_point_detections.json`. It records the selected last-frame index, both 2D selections, the bird's-eye epipolar line, the triangulated world coordinate, and the closest-ray error. Last-frame visualizations are saved under `vlm_point_visualizations/`.
 
 Install the optional client dependency and set an API key first:
 
