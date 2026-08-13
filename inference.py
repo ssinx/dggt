@@ -991,6 +991,7 @@ def main():
                 source_intrinsic = intrinsic
                 localized_asset_points = None
                 localized_asset_rotations = None
+                localized_asset_scale_factors = None
                 if args.render_all_cameras or args.render_birds_eye:
                     reference_indices = torch.arange(
                         0,
@@ -1196,6 +1197,7 @@ def main():
                             )
                             localized_asset_points = {}
                             localized_asset_rotations = {}
+                            localized_asset_scale_factors = {}
                             correspondence_by_asset_id = {}
                             for spec, correspondence in zip(matching_asset_specs, correspondences):
                                 initial_position = torch.tensor(
@@ -1235,6 +1237,7 @@ def main():
                                     correspondence_by_asset_id[asset_id]["orientation_refinement"] = {
                                         "status": "disabled",
                                         "applied_yaw_delta_deg": 0.0,
+                                        "applied_scale_factor": 1.0,
                                     }
                                     continue
                                 selected_frames, frame_scores = select_asset_orientation_frames(
@@ -1276,6 +1279,7 @@ def main():
                                     refinement = {
                                         "status": "fallback_no_visible_candidate_frames",
                                         "applied_yaw_delta_deg": 0.0,
+                                        "applied_scale_factor": 1.0,
                                         "frame_selection": selection_debug,
                                     }
                                     correspondence_by_asset_id[asset_id]["orientation_refinement"] = refinement
@@ -1495,15 +1499,19 @@ def main():
                                     preview_frames=preview_frames,
                                     debug_dir=asset_debug_dir,
                                     max_yaw_delta_deg=float(spec["max_yaw_delta_deg"]),
+                                    min_scale_factor=float(spec["min_scale_factor"]),
+                                    max_scale_factor=float(spec["max_scale_factor"]),
                                     retries=args.vlm_retries,
                                     enable_thinking=args.vlm_enable_thinking,
                                 )
                                 refinement["frame_selection"] = selection_debug
                                 yaw_delta = float(refinement["applied_yaw_delta_deg"])
+                                scale_factor = float(refinement["applied_scale_factor"])
                                 rotation_delta = rotation_matrix_about_axis(
                                     down_direction_world, yaw_delta
                                 )
                                 localized_asset_rotations[asset_id] = rotation_delta
+                                localized_asset_scale_factors[asset_id] = scale_factor
                                 resnapped_position, resnap = snap_asset_placement_to_ground(
                                     asset=asset_cache[spec["_asset_path"]],
                                     spec=spec,
@@ -1514,10 +1522,13 @@ def main():
                                     down_direction_world=down_direction_world,
                                     scene_units_per_meter=asset_scene_scale,
                                     rotation_delta_world=rotation_delta,
+                                    asset_scale_factor=scale_factor,
                                 )
                                 localized_asset_points[asset_id] = resnapped_position
                                 refinement["post_rotation_ground_snap"] = resnap
                                 refinement["rotation_delta_world_3x3"] = rotation_delta.detach().cpu().tolist()
+                                refinement["initial_manifest_scale"] = float(spec["scale"])
+                                refinement["final_effective_scale"] = float(spec["scale"]) * scale_factor
                                 initial_rotation = asset_rotation_for_frame(
                                     spec, localization_frame_idx, rotation_delta.device
                                 )
@@ -1541,6 +1552,7 @@ def main():
                                 print(
                                     f"Orientation refinement for asset {asset_id}: {refinement['status']}, "
                                     f"yaw={yaw_delta:+.2f}deg, confidence={refinement.get('confidence', 0.0):.3f}, "
+                                    f"scale_factor={scale_factor:.3f}, "
                                     f"post-rotation ground adjustment="
                                     f"{resnap.get('vertical_adjustment_m', 0.0):+.4f}m"
                                 )
@@ -1611,6 +1623,7 @@ def main():
                                 asset_scene_scale,
                                 placement_points_world=localized_asset_points,
                                 rotation_deltas_world=localized_asset_rotations,
+                                scale_factors=localized_asset_scale_factors,
                             )
                             if frame_assets is not None:
                                 world_points, rgbs, opacity, scales, rotation = concat_list(

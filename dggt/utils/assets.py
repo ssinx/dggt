@@ -251,6 +251,8 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         resolved_spec.setdefault("orientation_top_k", 3)
         resolved_spec.setdefault("orientation_projection_max_points", 3000)
         resolved_spec.setdefault("max_yaw_delta_deg", 90.0)
+        resolved_spec.setdefault("min_scale_factor", 0.5)
+        resolved_spec.setdefault("max_scale_factor", 2.0)
         if float(resolved_spec["scale"]) <= 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a non-positive scale.")
         if float(resolved_spec["opacity_scale"]) < 0:
@@ -274,6 +276,12 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
             )
         if not 0 < float(resolved_spec["max_yaw_delta_deg"]) <= 180:
             raise ValueError(f"Asset {resolved_spec['id']} field max_yaw_delta_deg must be in (0, 180].")
+        if float(resolved_spec["min_scale_factor"]) <= 0:
+            raise ValueError(f"Asset {resolved_spec['id']} field min_scale_factor must be positive.")
+        if float(resolved_spec["max_scale_factor"]) < float(resolved_spec["min_scale_factor"]):
+            raise ValueError(
+                f"Asset {resolved_spec['id']} field max_scale_factor must be at least min_scale_factor."
+            )
         assets.append(resolved_spec)
     manifest["assets"] = assets
     manifest["_manifest_path"] = str(manifest_path)
@@ -592,6 +600,7 @@ def snap_asset_placement_to_ground(
     down_direction_world: torch.Tensor,
     scene_units_per_meter: float,
     rotation_delta_world: torch.Tensor | None = None,
+    asset_scale_factor: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Move an asset only vertically until its opaque lower contour touches local ground."""
     initial_position = torch.as_tensor(
@@ -612,6 +621,7 @@ def snap_asset_placement_to_ground(
         "enabled": bool(spec["ground_snap"]),
         "initial_world_coordinate_xyz": initial_position.detach().cpu().tolist(),
         "down_direction_world_xyz": down.detach().cpu().tolist(),
+        "effective_asset_scale": float(spec["scale"]) * float(asset_scale_factor),
     }
     if not spec["ground_snap"]:
         diagnostics.update({"status": "disabled", "final_world_coordinate_xyz": diagnostics["initial_world_coordinate_xyz"]})
@@ -711,6 +721,7 @@ def snap_asset_placement_to_ground(
     relative_asset_means = (
         asset["means"][asset_mask]
         * float(spec["scale"])
+        * float(asset_scale_factor)
         * scene_scale
     ) @ rotation.transpose(0, 1)
     asset_down_coordinates = relative_asset_means @ down
@@ -746,6 +757,7 @@ def get_assets_for_frame(
     scene_units_per_meter: float,
     placement_points_world: dict[str, torch.Tensor] | None = None,
     rotation_deltas_world: dict[str, torch.Tensor] | None = None,
+    scale_factors: dict[str, float] | None = None,
     only_asset_ids: set[str] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return all configured external assets that should be rendered in one frame."""
@@ -776,7 +788,8 @@ def get_assets_for_frame(
         transformed = transform_asset_gaussians(
             asset,
             transform,
-            asset_scale=float(spec["scale"]),
+            asset_scale=float(spec["scale"])
+            * (float(scale_factors[spec["id"]]) if scale_factors and spec["id"] in scale_factors else 1.0),
             scene_units_per_meter=scene_units_per_meter,
         )
         opacity_scale = float(spec["opacity_scale"])

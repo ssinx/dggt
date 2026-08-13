@@ -139,24 +139,32 @@ def refine_asset_orientation(
     preview_frames: list[tuple[str, int, Any]],
     debug_dir: str | Path,
     max_yaw_delta_deg: float,
+    min_scale_factor: float,
+    max_scale_factor: float,
     retries: int,
     enable_thinking: bool,
 ) -> dict[str, Any]:
-    """Ask a VLM for one constrained world-vertical rotation from several previews."""
+    """Ask a VLM for constrained yaw and uniform-scale corrections from several previews."""
     debug_dir = Path(debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
     saved_images = []
     content: list[dict[str, Any]] = []
     instruction = (
         "You inspect an initially inserted 3D Gaussian asset in a driving scene and decide whether its "
-        "horizontal orientation needs correction. Images are labeled as front-view or bird's-eye previews. "
+        "horizontal orientation and uniform physical scale need correction. Images are labeled as front-view "
+        "or bird's-eye previews. "
         "Use all views together and follow the user's placement request. The asset's local coordinate axes are "
-        "arbitrary and have no semantic meaning. Return only a yaw correction about the scene's vertical axis; "
-        "do not propose pitch, roll, translation, or scale. Positive yaw means CLOCKWISE when viewed in the "
+        "arbitrary and have no semantic meaning. Return a yaw correction about the scene's vertical axis and a "
+        "uniform scale factor relative to the currently rendered asset. Do not propose pitch, roll, translation, "
+        "or non-uniform scaling. Positive yaw means CLOCKWISE when viewed in the "
         "bird's-eye image, and negative yaw means counter-clockwise. If the current orientation already meets "
-        "the request, return zero. Return only one JSON object with no Markdown: "
-        '{"yaw_delta_deg":0.0,"confidence":0.0,"reason":"string"}. '
-        f"The yaw correction must be in [-{max_yaw_delta_deg:.3f}, {max_yaw_delta_deg:.3f}] degrees.\n\n"
+        "the request, return zero. A scale_factor below 1 makes the asset smaller and above 1 makes it larger; "
+        "return 1 when its size is already plausible. Judge physical size from comparable scene objects, lane "
+        "width, road geometry, and all views together. Do not shrink an asset merely because it is far from the "
+        "camera. Return only one JSON object with no Markdown: "
+        '{"yaw_delta_deg":0.0,"scale_factor":1.0,"confidence":0.0,"reason":"string"}. '
+        f"The yaw correction must be in [-{max_yaw_delta_deg:.3f}, {max_yaw_delta_deg:.3f}] degrees and "
+        f"scale_factor must be in [{min_scale_factor:.4f}, {max_scale_factor:.4f}].\n\n"
         f"Asset id: {asset_id}\nUser request: {user_prompt}"
     )
     content.append({"type": "input_text", "text": instruction})
@@ -196,23 +204,37 @@ def refine_asset_orientation(
             if not isinstance(parsed, dict):
                 raise ValueError("Orientation response is not a JSON object.")
             yaw = parsed.get("yaw_delta_deg")
+            scale_factor = parsed.get("scale_factor")
             confidence = parsed.get("confidence")
             reason = parsed.get("reason")
             if not isinstance(yaw, (int, float)) or not np.isfinite(yaw):
                 raise ValueError("Orientation response has invalid yaw_delta_deg.")
+            if not isinstance(scale_factor, (int, float)) or not np.isfinite(scale_factor):
+                raise ValueError("Orientation response has invalid scale_factor.")
             if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
                 raise ValueError("Orientation response has invalid confidence.")
             if not isinstance(reason, str):
                 raise ValueError("Orientation response has invalid reason.")
             requested_yaw = float(yaw)
             applied_yaw = float(np.clip(requested_yaw, -max_yaw_delta_deg, max_yaw_delta_deg))
+            requested_scale_factor = float(scale_factor)
+            applied_scale_factor = float(
+                np.clip(requested_scale_factor, min_scale_factor, max_scale_factor)
+            )
             result = {
                 "status": "refined",
                 "asset_id": asset_id,
                 "yaw_convention": "positive_is_clockwise_in_birds_eye_view",
                 "requested_yaw_delta_deg": requested_yaw,
                 "applied_yaw_delta_deg": applied_yaw,
-                "was_clamped": requested_yaw != applied_yaw,
+                "was_clamped": (
+                    requested_yaw != applied_yaw
+                    or requested_scale_factor != applied_scale_factor
+                ),
+                "requested_scale_factor": requested_scale_factor,
+                "applied_scale_factor": applied_scale_factor,
+                "yaw_was_clamped": requested_yaw != applied_yaw,
+                "scale_was_clamped": requested_scale_factor != applied_scale_factor,
                 "confidence": float(confidence),
                 "reason": reason,
                 "input_images": saved_images,
@@ -232,6 +254,7 @@ def refine_asset_orientation(
         "status": "fallback_vlm_error",
         "asset_id": asset_id,
         "applied_yaw_delta_deg": 0.0,
+        "applied_scale_factor": 1.0,
         "error": f"{type(last_error).__name__}: {last_error}",
         "input_images": saved_images,
         "request_path": str(debug_dir / "request.txt"),
