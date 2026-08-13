@@ -118,6 +118,117 @@ def save_localization_results(results: dict[str, Any], output_path: str | Path) 
     output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def refine_asset_orientation(
+    client: Any,
+    model: str,
+    user_prompt: str,
+    asset_id: str,
+    preview_frames: list[tuple[str, int, Any]],
+    debug_dir: str | Path,
+    max_yaw_delta_deg: float,
+    retries: int,
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    """Ask a VLM for one constrained world-vertical rotation from several previews."""
+    debug_dir = Path(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    saved_images = []
+    content: list[dict[str, Any]] = []
+    instruction = (
+        "You inspect an initially inserted 3D Gaussian asset in a driving scene and decide whether its "
+        "horizontal orientation needs correction. Images are labeled as front-view or bird's-eye previews. "
+        "Use all views together and follow the user's placement request. The asset's local coordinate axes are "
+        "arbitrary and have no semantic meaning. Return only a yaw correction about the scene's vertical axis; "
+        "do not propose pitch, roll, translation, or scale. Positive yaw means CLOCKWISE when viewed in the "
+        "bird's-eye image, and negative yaw means counter-clockwise. If the current orientation already meets "
+        "the request, return zero. Return only one JSON object with no Markdown: "
+        '{"yaw_delta_deg":0.0,"confidence":0.0,"reason":"string"}. '
+        f"The yaw correction must be in [-{max_yaw_delta_deg:.3f}, {max_yaw_delta_deg:.3f}] degrees.\n\n"
+        f"Asset id: {asset_id}\nUser request: {user_prompt}"
+    )
+    content.append({"type": "input_text", "text": instruction})
+    for image_index, (view_name, frame_index, frame) in enumerate(preview_frames):
+        rgb_frame = _ensure_rgb_frame(frame)
+        filename = f"input_{image_index:02d}_{view_name}_frame_{frame_index:04d}.png"
+        image_path = debug_dir / filename
+        Image.fromarray(rgb_frame).save(image_path)
+        saved_images.append(str(image_path))
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"Image {image_index + 1}: {view_name}, sequence frame {frame_index}.",
+            }
+        )
+        content.append({"type": "input_image", "image_url": _frame_to_png_data_url(rgb_frame)})
+
+    image_descriptions = [
+        f"Image {index + 1}: {view_name}, sequence frame {frame_index}."
+        for index, (view_name, frame_index, _) in enumerate(preview_frames)
+    ]
+    (debug_dir / "request.txt").write_text(
+        instruction + "\n\n" + "\n".join(image_descriptions) + "\n",
+        encoding="utf-8",
+    )
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.responses.create(
+                model=model,
+                input=[{"role": "user", "content": content}],
+                extra_body={"enable_thinking": enable_thinking},
+            )
+            raw_response = _response_text(response)
+            (debug_dir / "response_raw.txt").write_text(raw_response + "\n", encoding="utf-8")
+            parsed = json.loads(_strip_json_fence(raw_response))
+            if not isinstance(parsed, dict):
+                raise ValueError("Orientation response is not a JSON object.")
+            yaw = parsed.get("yaw_delta_deg")
+            confidence = parsed.get("confidence")
+            reason = parsed.get("reason")
+            if not isinstance(yaw, (int, float)) or not np.isfinite(yaw):
+                raise ValueError("Orientation response has invalid yaw_delta_deg.")
+            if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+                raise ValueError("Orientation response has invalid confidence.")
+            if not isinstance(reason, str):
+                raise ValueError("Orientation response has invalid reason.")
+            requested_yaw = float(yaw)
+            applied_yaw = float(np.clip(requested_yaw, -max_yaw_delta_deg, max_yaw_delta_deg))
+            result = {
+                "status": "refined",
+                "asset_id": asset_id,
+                "yaw_convention": "positive_is_clockwise_in_birds_eye_view",
+                "requested_yaw_delta_deg": requested_yaw,
+                "applied_yaw_delta_deg": applied_yaw,
+                "was_clamped": requested_yaw != applied_yaw,
+                "confidence": float(confidence),
+                "reason": reason,
+                "input_images": saved_images,
+                "request_path": str(debug_dir / "request.txt"),
+                "raw_response_path": str(debug_dir / "response_raw.txt"),
+            }
+            (debug_dir / "result.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            return result
+        except Exception as error:
+            last_error = error
+            if attempt == retries:
+                break
+            time.sleep(2**attempt)
+    failure = {
+        "status": "fallback_vlm_error",
+        "asset_id": asset_id,
+        "applied_yaw_delta_deg": 0.0,
+        "error": f"{type(last_error).__name__}: {last_error}",
+        "input_images": saved_images,
+        "request_path": str(debug_dir / "request.txt"),
+    }
+    (debug_dir / "result.json").write_text(
+        json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return failure
+
+
 def _pixel_ray(pixel: Any, extrinsic: torch.Tensor, intrinsic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     pixel_h = torch.tensor([float(pixel[0]), float(pixel[1]), 1.0], device=extrinsic.device, dtype=extrinsic.dtype)
     direction_camera = torch.linalg.solve(intrinsic, pixel_h)

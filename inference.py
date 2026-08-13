@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import time
@@ -11,7 +12,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from torchvision.utils import save_image
-from PIL import Image
+from PIL import Image, ImageDraw
 import imageio
 import matplotlib
 import matplotlib.pyplot as plt
@@ -23,10 +24,23 @@ from third_party.TAPIP3D.utils.inference_utils import load_model, read_video, in
 from dggt.models.vggt import VGGT
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
-from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets, snap_asset_placement_to_ground
+from dggt.utils.assets import (
+    asset_rotation_for_frame,
+    get_assets_for_frame,
+    load_asset_manifest,
+    load_manifest_assets,
+    rotation_matrix_about_axis,
+    select_asset_orientation_frames,
+    snap_asset_placement_to_ground,
+)
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
-from dggt.utils.vlm_point_localization import create_qwen_client, localize_corresponding_points_in_frame, save_localization_results
+from dggt.utils.vlm_point_localization import (
+    create_qwen_client,
+    localize_corresponding_points_in_frame,
+    refine_asset_orientation,
+    save_localization_results,
+)
 from gsplat.rendering import rasterization
 from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset, load_and_preprocess_images
 from utils.interplation import interp_all
@@ -976,6 +990,7 @@ def main():
                 source_extrinsic = extrinsic
                 source_intrinsic = intrinsic
                 localized_asset_points = None
+                localized_asset_rotations = None
                 if args.render_all_cameras or args.render_birds_eye:
                     reference_indices = torch.arange(
                         0,
@@ -1091,9 +1106,10 @@ def main():
                                 localization_foregrounds.append(localization_render[..., :-1])
                                 localization_alphas.append(localization_alpha)
 
-                            source_localization_sky = model.sky_model(
-                                images, source_extrinsic, source_intrinsic
-                            )[localization_idx:localization_idx + 1]
+                            source_sky_render = model.sky_model(images, source_extrinsic, source_intrinsic)
+                            source_localization_sky = source_sky_render[
+                                localization_idx:localization_idx + 1
+                            ]
                             birds_localization_sky = model.sky_model.forward_with_new_pose(
                                 images,
                                 source_extrinsic,
@@ -1179,6 +1195,8 @@ def main():
                                 dtype=extrinsic.dtype,
                             )
                             localized_asset_points = {}
+                            localized_asset_rotations = {}
+                            correspondence_by_asset_id = {}
                             for spec, correspondence in zip(matching_asset_specs, correspondences):
                                 initial_position = torch.tensor(
                                     correspondence["world_coordinate_xyz"],
@@ -1196,6 +1214,7 @@ def main():
                                     scene_units_per_meter=asset_scene_scale,
                                 )
                                 localized_asset_points[spec["id"]] = corrected_position
+                                correspondence_by_asset_id[spec["id"]] = correspondence
                                 correspondence["asset_id"] = spec["id"]
                                 correspondence["ground_snap"] = ground_snap
                                 correspondence["world_coordinate_xyz"] = ground_snap[
@@ -1205,6 +1224,325 @@ def main():
                                     f"Ground snap for asset {spec['id']}: {ground_snap['status']}, "
                                     f"vertical adjustment={ground_snap.get('vertical_adjustment_m', 0.0):+.4f}m, "
                                     f"local points={ground_snap.get('local_scene_point_count', 0)}"
+                                )
+
+                            orientation_debug_root = os.path.join(
+                                scene_out_dir, "vlm_orientation_refinement"
+                            )
+                            for spec in matching_asset_specs:
+                                asset_id = spec["id"]
+                                if not spec["vlm_orientation_refine"]:
+                                    correspondence_by_asset_id[asset_id]["orientation_refinement"] = {
+                                        "status": "disabled",
+                                        "applied_yaw_delta_deg": 0.0,
+                                    }
+                                    continue
+                                selected_frames, frame_scores = select_asset_orientation_frames(
+                                    asset=asset_cache[spec["_asset_path"]],
+                                    spec=spec,
+                                    frame_extrinsics=reference_extrinsic,
+                                    frame_intrinsics=reference_intrinsic,
+                                    image_height=H,
+                                    image_width=W,
+                                    placement_position_world=localized_asset_points[asset_id],
+                                    scene_units_per_meter=asset_scene_scale,
+                                )
+                                asset_debug_dir = os.path.join(orientation_debug_root, asset_id)
+                                os.makedirs(asset_debug_dir, exist_ok=True)
+                                selection_debug = {
+                                    "asset_id": asset_id,
+                                    "selection_method": "axis_independent_projection_geometry_with_view_diversity",
+                                    "selected_frame_indices": selected_frames,
+                                    "frame_scores": frame_scores,
+                                }
+                                with open(
+                                    os.path.join(asset_debug_dir, "frame_scores.json"),
+                                    "w",
+                                    encoding="utf-8",
+                                ) as score_file:
+                                    json.dump(selection_debug, score_file, ensure_ascii=False, indent=2)
+                                    score_file.write("\n")
+                                print(
+                                    f"Orientation candidates for asset {asset_id}: {selected_frames}; "
+                                    f"scores="
+                                    + ", ".join(
+                                        f"{entry['frame_index']}:{entry['score']:.3f}"
+                                        for entry in sorted(
+                                            frame_scores, key=lambda item: item["score"], reverse=True
+                                        )[:6]
+                                    )
+                                )
+                                if not selected_frames:
+                                    refinement = {
+                                        "status": "fallback_no_visible_candidate_frames",
+                                        "applied_yaw_delta_deg": 0.0,
+                                        "frame_selection": selection_debug,
+                                    }
+                                    correspondence_by_asset_id[asset_id]["orientation_refinement"] = refinement
+                                    with open(
+                                        os.path.join(asset_debug_dir, "result.json"),
+                                        "w",
+                                        encoding="utf-8",
+                                    ) as result_file:
+                                        json.dump(refinement, result_file, ensure_ascii=False, indent=2)
+                                        result_file.write("\n")
+                                    continue
+
+                                preview_frames = []
+                                score_by_frame = {
+                                    entry["frame_index"]: entry for entry in frame_scores
+                                }
+                                for preview_frame_idx in selected_frames:
+                                    preview_source_idx = int(reference_indices[preview_frame_idx].item())
+                                    preview_t0 = timestamps[preview_source_idx]
+                                    preview_static_opacity = alpha_t(
+                                        gs_timestamps,
+                                        preview_t0,
+                                        static_opacity,
+                                        gamma0=static_gs_conf,
+                                    )
+                                    preview_scene = concat_list(
+                                        [
+                                            static_points,
+                                            static_rgbs,
+                                            preview_static_opacity,
+                                            static_scales,
+                                            static_rotations,
+                                        ],
+                                        [
+                                            dynamic_points[preview_source_idx],
+                                            dynamic_rgbs[preview_source_idx],
+                                            dynamic_opacitys[preview_source_idx],
+                                            dynamic_scales[preview_source_idx],
+                                            dynamic_rotations[preview_source_idx],
+                                        ],
+                                    )
+                                    preview_asset = get_assets_for_frame(
+                                        asset_manifest,
+                                        asset_cache,
+                                        scene_name,
+                                        preview_frame_idx,
+                                        asset_scene_scale,
+                                        placement_points_world=localized_asset_points,
+                                        only_asset_ids={asset_id},
+                                    )
+                                    preview_world = preview_scene
+                                    if preview_asset is not None:
+                                        preview_world = concat_list(
+                                            list(preview_scene),
+                                            [
+                                                preview_asset["means"],
+                                                preview_asset["colors"],
+                                                preview_asset["opacities"],
+                                                preview_asset["scales"],
+                                                preview_asset["quats"],
+                                            ],
+                                        )
+                                    preview_render, preview_alpha, _ = rasterization(
+                                        means=preview_world[0],
+                                        colors=preview_world[1],
+                                        opacities=preview_world[2],
+                                        scales=preview_world[3],
+                                        quats=preview_world[4],
+                                        viewmats=extrinsic[preview_source_idx:preview_source_idx + 1],
+                                        Ks=intrinsic[preview_source_idx:preview_source_idx + 1],
+                                        width=W,
+                                        height=H,
+                                        render_mode="RGB+ED",
+                                    )
+                                    preview_sky = source_sky_render[
+                                        preview_source_idx:preview_source_idx + 1
+                                    ]
+                                    preview_sky = (preview_sky - preview_sky.min()) / (
+                                        preview_sky.max() - preview_sky.min() + 1e-8
+                                    )
+                                    preview_image = (
+                                        preview_alpha * preview_render[..., :-1]
+                                        + (1 - preview_alpha) * preview_sky
+                                    )[0]
+                                    preview_array = preview_image.detach().cpu().clamp(0, 1).mul(255).byte().numpy()
+                                    Image.fromarray(preview_array).save(
+                                        os.path.join(
+                                            asset_debug_dir,
+                                            f"preview_raw_front_view_frame_{preview_frame_idx:04d}.png",
+                                        )
+                                    )
+                                    annotated_preview = Image.fromarray(preview_array)
+                                    preview_draw = ImageDraw.Draw(annotated_preview)
+                                    bbox = score_by_frame[preview_frame_idx].get("bbox_pixels_xyxy")
+                                    if bbox is not None:
+                                        line_width = max(3, min(W, H) // 180)
+                                        preview_draw.rectangle(
+                                            tuple(bbox), outline="#ff1744", width=line_width
+                                        )
+                                        preview_draw.text(
+                                            (bbox[0] + line_width, max(0, bbox[1] - 16)),
+                                            "INSERTED ASSET",
+                                            fill="#ff1744",
+                                        )
+                                    preview_frames.append(
+                                        (
+                                            "front_view",
+                                            preview_frame_idx,
+                                            np.asarray(annotated_preview),
+                                        )
+                                    )
+
+                                bird_preview_idx = selected_frames[0]
+                                bird_source_idx = int(reference_indices[bird_preview_idx].item())
+                                bird_t0 = timestamps[bird_source_idx]
+                                bird_static_opacity = alpha_t(
+                                    gs_timestamps, bird_t0, static_opacity, gamma0=static_gs_conf
+                                )
+                                bird_scene = concat_list(
+                                    [static_points, static_rgbs, bird_static_opacity, static_scales, static_rotations],
+                                    [
+                                        dynamic_points[bird_source_idx],
+                                        dynamic_rgbs[bird_source_idx],
+                                        dynamic_opacitys[bird_source_idx],
+                                        dynamic_scales[bird_source_idx],
+                                        dynamic_rotations[bird_source_idx],
+                                    ],
+                                )
+                                bird_asset = get_assets_for_frame(
+                                    asset_manifest,
+                                    asset_cache,
+                                    scene_name,
+                                    bird_preview_idx,
+                                    asset_scene_scale,
+                                    placement_points_world=localized_asset_points,
+                                    only_asset_ids={asset_id},
+                                )
+                                bird_world = bird_scene
+                                if bird_asset is not None:
+                                    bird_world = concat_list(
+                                        list(bird_scene),
+                                        [
+                                            bird_asset["means"], bird_asset["colors"], bird_asset["opacities"],
+                                            bird_asset["scales"], bird_asset["quats"],
+                                        ],
+                                    )
+                                bird_render, bird_alpha, _ = rasterization(
+                                    means=bird_world[0], colors=bird_world[1], opacities=bird_world[2],
+                                    scales=bird_world[3], quats=bird_world[4],
+                                    viewmats=birds_eye_extrinsic[bird_preview_idx:bird_preview_idx + 1],
+                                    Ks=birds_eye_intrinsic[bird_preview_idx:bird_preview_idx + 1],
+                                    width=W, height=H, render_mode="RGB+ED",
+                                )
+                                bird_sky = model.sky_model.forward_with_new_pose(
+                                    images, source_extrinsic, source_intrinsic,
+                                    birds_eye_extrinsic[bird_preview_idx:bird_preview_idx + 1],
+                                    birds_eye_intrinsic[bird_preview_idx:bird_preview_idx + 1],
+                                    output_height=H, output_width=W,
+                                )
+                                bird_sky = (bird_sky - bird_sky.min()) / (
+                                    bird_sky.max() - bird_sky.min() + 1e-8
+                                )
+                                bird_image = (
+                                    bird_alpha * bird_render[..., :-1] + (1 - bird_alpha) * bird_sky
+                                )[0]
+                                bird_array = bird_image.detach().cpu().clamp(0, 1).mul(255).byte().numpy()
+                                Image.fromarray(bird_array).save(
+                                    os.path.join(
+                                        asset_debug_dir,
+                                        f"preview_raw_birds_eye_frame_{bird_preview_idx:04d}.png",
+                                    )
+                                )
+                                bird_annotated = Image.fromarray(bird_array)
+                                bird_draw = ImageDraw.Draw(bird_annotated)
+                                bird_camera_point = (
+                                    localized_asset_points[asset_id]
+                                    @ birds_eye_extrinsic[bird_preview_idx, :3, :3].transpose(0, 1)
+                                    + birds_eye_extrinsic[bird_preview_idx, :3, 3]
+                                )
+                                bird_projected = bird_camera_point @ birds_eye_intrinsic[bird_preview_idx].transpose(0, 1)
+                                bird_pixel = bird_projected[:2] / bird_projected[2].clamp_min(1e-6)
+                                marker_radius = max(8, min(W, H) // 35)
+                                bird_x, bird_y = (float(value.item()) for value in bird_pixel)
+                                bird_draw.ellipse(
+                                    (
+                                        bird_x - marker_radius,
+                                        bird_y - marker_radius,
+                                        bird_x + marker_radius,
+                                        bird_y + marker_radius,
+                                    ),
+                                    outline="#ff1744",
+                                    width=max(3, min(W, H) // 180),
+                                )
+                                bird_draw.text(
+                                    (bird_x + marker_radius, bird_y), "INSERTED ASSET", fill="#ff1744"
+                                )
+                                preview_frames.append(
+                                    (
+                                        "birds_eye",
+                                        bird_preview_idx,
+                                        np.asarray(bird_annotated),
+                                    )
+                                )
+                                orientation_prompt = str(spec["orientation_prompt"]).strip()
+                                if orientation_prompt:
+                                    orientation_prompt = args.vlm_prompt + "\nOrientation requirement: " + orientation_prompt
+                                else:
+                                    orientation_prompt = args.vlm_prompt + (
+                                        "\nOrientation requirement: make the inserted asset face the most "
+                                        "semantically plausible direction for the road and the request."
+                                    )
+                                refinement = refine_asset_orientation(
+                                    client=args.vlm_client,
+                                    model=args.vlm_model,
+                                    user_prompt=orientation_prompt,
+                                    asset_id=asset_id,
+                                    preview_frames=preview_frames,
+                                    debug_dir=asset_debug_dir,
+                                    max_yaw_delta_deg=float(spec["max_yaw_delta_deg"]),
+                                    retries=args.vlm_retries,
+                                    enable_thinking=args.vlm_enable_thinking,
+                                )
+                                refinement["frame_selection"] = selection_debug
+                                yaw_delta = float(refinement["applied_yaw_delta_deg"])
+                                rotation_delta = rotation_matrix_about_axis(
+                                    down_direction_world, yaw_delta
+                                )
+                                localized_asset_rotations[asset_id] = rotation_delta
+                                resnapped_position, resnap = snap_asset_placement_to_ground(
+                                    asset=asset_cache[spec["_asset_path"]],
+                                    spec=spec,
+                                    frame_index=localization_frame_idx,
+                                    initial_position_world=localized_asset_points[asset_id],
+                                    scene_points_world=localization_scene_points,
+                                    scene_opacities=localization_scene_opacity,
+                                    down_direction_world=down_direction_world,
+                                    scene_units_per_meter=asset_scene_scale,
+                                    rotation_delta_world=rotation_delta,
+                                )
+                                localized_asset_points[asset_id] = resnapped_position
+                                refinement["post_rotation_ground_snap"] = resnap
+                                refinement["rotation_delta_world_3x3"] = rotation_delta.detach().cpu().tolist()
+                                initial_rotation = asset_rotation_for_frame(
+                                    spec, localization_frame_idx, rotation_delta.device
+                                )
+                                refinement["initial_asset_to_world_rotation_3x3"] = (
+                                    initial_rotation.detach().cpu().tolist()
+                                )
+                                refinement["final_asset_to_world_rotation_3x3"] = (
+                                    (rotation_delta @ initial_rotation).detach().cpu().tolist()
+                                )
+                                correspondence_by_asset_id[asset_id]["orientation_refinement"] = refinement
+                                correspondence_by_asset_id[asset_id]["world_coordinate_xyz"] = resnap[
+                                    "final_world_coordinate_xyz"
+                                ]
+                                with open(
+                                    os.path.join(asset_debug_dir, "result.json"),
+                                    "w",
+                                    encoding="utf-8",
+                                ) as result_file:
+                                    json.dump(refinement, result_file, ensure_ascii=False, indent=2)
+                                    result_file.write("\n")
+                                print(
+                                    f"Orientation refinement for asset {asset_id}: {refinement['status']}, "
+                                    f"yaw={yaw_delta:+.2f}deg, confidence={refinement.get('confidence', 0.0):.3f}, "
+                                    f"post-rotation ground adjustment="
+                                    f"{resnap.get('vertical_adjustment_m', 0.0):+.4f}m"
                                 )
                             save_localization_results(localization, localization_output_path)
                             print(
@@ -1272,6 +1610,7 @@ def main():
                                 render_frame_idx,
                                 asset_scene_scale,
                                 placement_points_world=localized_asset_points,
+                                rotation_deltas_world=localized_asset_rotations,
                             )
                             if frame_assets is not None:
                                 world_points, rgbs, opacity, scales, rotation = concat_list(

@@ -168,6 +168,22 @@ By default, each localized asset is also snapped vertically to the last frame's 
 
 Distances in `ground_search_radius`, `ground_vertical_band`, and `ground_clearance_m` are meters. Set `ground_snap` to `false` to keep the raw triangulated height. Ground fitting status, point counts, residual, original position, vertical adjustment, and final position are recorded under each correspondence's `ground_snap` field in `vlm_point_detections.json`.
 
+After ground snapping, VLM localization also refines each inserted asset's horizontal orientation by default. Candidate frames are selected without another model call: opaque asset Gaussians are projected into every source frame, scored by projected size, in-frame ratio, and crop completeness, then up to three geometrically diverse views are retained. The selected front views and one bird's-eye view are sent in a single VLM request per asset. Asset-local axes are not used by frame selection or by the VLM protocol. Qwen returns only a bounded yaw correction about the reconstructed scene's vertical axis; the rotated asset is snapped to the ground again before the final sequence is rendered.
+
+Optional per-asset manifest settings are:
+
+```json
+{
+  "vlm_orientation_refine": true,
+  "orientation_prompt": "Place the vehicle parallel to its lane and facing the traffic direction.",
+  "orientation_top_k": 3,
+  "orientation_projection_max_points": 3000,
+  "max_yaw_delta_deg": 90
+}
+```
+
+Set `vlm_orientation_refine` to `false` to retain the manifest rotation. Frame selection uses at most `orientation_projection_max_points` asset Gaussians and does not call VLM; only the selected previews are rendered, followed by one multi-image VLM request for that asset. Debug artifacts are written to `vlm_orientation_refinement/<asset_id>/`: projection scores and selected frame IDs, raw unannotated previews, the red-box/red-circle images sent to Qwen, the complete request text, raw response, parsed yaw instruction, rotation matrix, and post-rotation ground-snap diagnostics. The same data is embedded under `orientation_refinement` in `vlm_point_detections.json`. Final corrected frames remain under `source_camera/` and `birds_eye/`.
+
 Install the optional client dependency and set an API key first:
 
 ```bash

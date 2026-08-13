@@ -246,6 +246,11 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         resolved_spec.setdefault("ground_vertical_band", 1.5)
         resolved_spec.setdefault("ground_min_points", 32)
         resolved_spec.setdefault("ground_clearance_m", 0.0)
+        resolved_spec.setdefault("vlm_orientation_refine", True)
+        resolved_spec.setdefault("orientation_prompt", "")
+        resolved_spec.setdefault("orientation_top_k", 3)
+        resolved_spec.setdefault("orientation_projection_max_points", 3000)
+        resolved_spec.setdefault("max_yaw_delta_deg", 90.0)
         if float(resolved_spec["scale"]) <= 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a non-positive scale.")
         if float(resolved_spec["opacity_scale"]) < 0:
@@ -261,6 +266,14 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
                 raise ValueError(f"Asset {resolved_spec['id']} field {field_name} must be positive.")
         if int(resolved_spec["ground_min_points"]) < 3:
             raise ValueError(f"Asset {resolved_spec['id']} field ground_min_points must be at least 3.")
+        if int(resolved_spec["orientation_top_k"]) < 1:
+            raise ValueError(f"Asset {resolved_spec['id']} field orientation_top_k must be at least 1.")
+        if int(resolved_spec["orientation_projection_max_points"]) < 32:
+            raise ValueError(
+                f"Asset {resolved_spec['id']} field orientation_projection_max_points must be at least 32."
+            )
+        if not 0 < float(resolved_spec["max_yaw_delta_deg"]) <= 180:
+            raise ValueError(f"Asset {resolved_spec['id']} field max_yaw_delta_deg must be in (0, 180].")
         assets.append(resolved_spec)
     manifest["assets"] = assets
     manifest["_manifest_path"] = str(manifest_path)
@@ -385,6 +398,159 @@ def _scene_matches(spec: dict[str, Any], scene_name: str) -> bool:
     raise ValueError(f"Asset {spec['id']} scene_names must be a string or a list of strings.")
 
 
+def rotation_matrix_about_axis(axis: torch.Tensor, angle_degrees: float) -> torch.Tensor:
+    """Return a right-handed rotation about an arbitrary world-space axis."""
+    axis = torch.as_tensor(axis)
+    axis = axis / torch.linalg.vector_norm(axis)
+    angle = torch.deg2rad(torch.as_tensor(angle_degrees, device=axis.device, dtype=axis.dtype))
+    x, y, z = axis
+    zero = torch.zeros((), device=axis.device, dtype=axis.dtype)
+    skew = torch.stack(
+        (
+            torch.stack((zero, -z, y)),
+            torch.stack((z, zero, -x)),
+            torch.stack((-y, x, zero)),
+        )
+    )
+    identity = torch.eye(3, device=axis.device, dtype=axis.dtype)
+    return identity + torch.sin(angle) * skew + (1 - torch.cos(angle)) * (skew @ skew)
+
+
+def asset_rotation_for_frame(
+    spec: dict[str, Any], frame_index: int, device: torch.device
+) -> torch.Tensor:
+    """Return the manifest rotation active in a frame."""
+    transform = _asset_transform_for_frame(spec, frame_index, device)
+    if transform is None:
+        raise ValueError(f"Asset {spec['id']} is not active in frame {frame_index}.")
+    return transform[:3, :3]
+
+
+def select_asset_orientation_frames(
+    asset: dict[str, torch.Tensor],
+    spec: dict[str, Any],
+    frame_extrinsics: torch.Tensor,
+    frame_intrinsics: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    placement_position_world: torch.Tensor,
+    scene_units_per_meter: float,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Select clear, diverse views using only asset projection geometry."""
+    device = asset["means"].device
+    position = torch.as_tensor(placement_position_world, device=device, dtype=asset["means"].dtype)
+    opaque_mask = asset["opacities"] >= float(spec["contact_opacity_threshold"])
+    local_means = asset["means"][opaque_mask]
+    if local_means.shape[0] < 32:
+        local_means = asset["means"]
+    maximum_points = int(spec["orientation_projection_max_points"])
+    if local_means.shape[0] > maximum_points:
+        sample_indices = torch.linspace(
+            0, local_means.shape[0] - 1, maximum_points, device=device
+        ).long()
+        local_means = local_means[sample_indices]
+
+    frame_scores: list[dict[str, Any]] = []
+    camera_centers: dict[int, torch.Tensor] = {}
+    for frame_index in range(frame_extrinsics.shape[0]):
+        transform = _asset_transform_for_frame(spec, frame_index, device)
+        if transform is None:
+            continue
+        rotation = transform[:3, :3]
+        world_means = (
+            local_means * float(spec["scale"]) @ rotation.transpose(0, 1)
+        ) * float(scene_units_per_meter) + position
+        extrinsic = frame_extrinsics[frame_index]
+        intrinsic = frame_intrinsics[frame_index]
+        camera_means = world_means @ extrinsic[:3, :3].transpose(0, 1) + extrinsic[:3, 3]
+        positive_depth = camera_means[:, 2] > 1e-6
+        projected = camera_means @ intrinsic.transpose(0, 1)
+        pixels = projected[:, :2] / projected[:, 2:3].clamp_min(1e-6)
+        finite = torch.isfinite(pixels).all(dim=-1) & positive_depth
+        if not finite.any():
+            frame_scores.append({"frame_index": frame_index, "score": 0.0, "status": "behind_camera"})
+            continue
+        valid_pixels = pixels[finite]
+        in_frame = (
+            (valid_pixels[:, 0] >= 0)
+            & (valid_pixels[:, 0] <= image_width - 1)
+            & (valid_pixels[:, 1] >= 0)
+            & (valid_pixels[:, 1] <= image_height - 1)
+        )
+        minimum = valid_pixels.amin(dim=0)
+        maximum = valid_pixels.amax(dim=0)
+        clipped_minimum = torch.maximum(minimum, minimum.new_tensor([0.0, 0.0]))
+        clipped_maximum = torch.minimum(
+            maximum, maximum.new_tensor([float(image_width - 1), float(image_height - 1)])
+        )
+        full_size = (maximum - minimum).clamp_min(0)
+        clipped_size = (clipped_maximum - clipped_minimum).clamp_min(0)
+        full_area = full_size.prod()
+        clipped_area = clipped_size.prod()
+        image_area = float(image_height * image_width)
+        projected_area_ratio = float((clipped_area / image_area).item())
+        in_frame_ratio = float(in_frame.float().mean().item())
+        crop_completeness = float((clipped_area / full_area.clamp_min(1.0)).clamp(0, 1).item())
+        resolution_score = min(projected_area_ratio / 0.08, 1.0)
+        score = (
+            0.45 * resolution_score
+            + 0.35 * in_frame_ratio
+            + 0.20 * crop_completeness
+        )
+        frame_scores.append(
+            {
+                "frame_index": frame_index,
+                "score": score,
+                "projected_area_ratio": projected_area_ratio,
+                "in_frame_ratio": in_frame_ratio,
+                "crop_completeness": crop_completeness,
+                "bbox_pixels_xyxy": [
+                    float(clipped_minimum[0].item()),
+                    float(clipped_minimum[1].item()),
+                    float(clipped_maximum[0].item()),
+                    float(clipped_maximum[1].item()),
+                ],
+                "sampled_asset_point_count": int(local_means.shape[0]),
+                "status": "scored",
+            }
+        )
+        camera_centers[frame_index] = -(
+            extrinsic[:3, :3].transpose(0, 1) @ extrinsic[:3, 3]
+        )
+
+    viable = [entry for entry in frame_scores if entry["score"] > 0 and entry["frame_index"] in camera_centers]
+    viable.sort(key=lambda entry: entry["score"], reverse=True)
+    selected: list[int] = []
+    top_k = min(int(spec["orientation_top_k"]), len(viable))
+    while len(selected) < top_k:
+        best_entry = None
+        best_selection_score = -1.0
+        for entry in viable:
+            frame_index = entry["frame_index"]
+            if frame_index in selected:
+                continue
+            diversity = 1.0
+            if selected:
+                candidate_ray = camera_centers[frame_index] - position
+                candidate_ray = candidate_ray / torch.linalg.vector_norm(candidate_ray)
+                angles = []
+                for selected_index in selected:
+                    selected_ray = camera_centers[selected_index] - position
+                    selected_ray = selected_ray / torch.linalg.vector_norm(selected_ray)
+                    cosine = torch.dot(candidate_ray, selected_ray).clamp(-1, 1)
+                    angles.append(float(torch.acos(cosine).item() / torch.pi))
+                diversity = min(angles)
+            selection_score = float(entry["score"]) * (0.75 + 0.25 * diversity)
+            if selection_score > best_selection_score:
+                best_entry = entry
+                best_selection_score = selection_score
+        if best_entry is None:
+            break
+        best_entry["selection_score"] = best_selection_score
+        selected.append(best_entry["frame_index"])
+    return selected, frame_scores
+
+
 def transform_asset_gaussians(
     asset: dict[str, torch.Tensor],
     asset_to_world_m: torch.Tensor,
@@ -425,6 +591,7 @@ def snap_asset_placement_to_ground(
     scene_opacities: torch.Tensor,
     down_direction_world: torch.Tensor,
     scene_units_per_meter: float,
+    rotation_delta_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Move an asset only vertically until its opaque lower contour touches local ground."""
     initial_position = torch.as_tensor(
@@ -537,6 +704,10 @@ def snap_asset_placement_to_ground(
     if not asset_mask.any():
         asset_mask = torch.ones_like(asset["opacities"], dtype=torch.bool)
     rotation = transform[:3, :3]
+    if rotation_delta_world is not None:
+        rotation = torch.as_tensor(
+            rotation_delta_world, device=rotation.device, dtype=rotation.dtype
+        ) @ rotation
     relative_asset_means = (
         asset["means"][asset_mask]
         * float(spec["scale"])
@@ -574,10 +745,14 @@ def get_assets_for_frame(
     frame_index: int,
     scene_units_per_meter: float,
     placement_points_world: dict[str, torch.Tensor] | None = None,
+    rotation_deltas_world: dict[str, torch.Tensor] | None = None,
+    only_asset_ids: set[str] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return all configured external assets that should be rendered in one frame."""
     transformed_assets = []
     for spec in manifest["assets"]:
+        if only_asset_ids is not None and spec["id"] not in only_asset_ids:
+            continue
         if not _scene_matches(spec, scene_name):
             continue
         asset = asset_cache[spec["_asset_path"]]
@@ -591,6 +766,13 @@ def get_assets_for_frame(
                 device=transform.device,
                 dtype=transform.dtype,
             ) / float(scene_units_per_meter)
+        if rotation_deltas_world is not None and spec["id"] in rotation_deltas_world:
+            rotation_delta = torch.as_tensor(
+                rotation_deltas_world[spec["id"]],
+                device=transform.device,
+                dtype=transform.dtype,
+            )
+            transform[:3, :3] = rotation_delta @ transform[:3, :3]
         transformed = transform_asset_gaussians(
             asset,
             transform,
