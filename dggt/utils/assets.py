@@ -237,10 +237,30 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         resolved_spec.setdefault("opacity_scale", 1.0)
         resolved_spec.setdefault("start_frame", 0)
         resolved_spec.setdefault("end_frame", None)
+        resolved_spec.setdefault("ground_snap", True)
+        resolved_spec.setdefault("contact_opacity_threshold", 0.05)
+        resolved_spec.setdefault("contact_quantile", 0.99)
+        resolved_spec.setdefault("ground_opacity_threshold", 0.05)
+        resolved_spec.setdefault("ground_quantile", 0.75)
+        resolved_spec.setdefault("ground_search_radius", 1.5)
+        resolved_spec.setdefault("ground_vertical_band", 1.5)
+        resolved_spec.setdefault("ground_min_points", 32)
+        resolved_spec.setdefault("ground_clearance_m", 0.0)
         if float(resolved_spec["scale"]) <= 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a non-positive scale.")
         if float(resolved_spec["opacity_scale"]) < 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a negative opacity_scale.")
+        for field_name in ("contact_opacity_threshold", "ground_opacity_threshold"):
+            if not 0 <= float(resolved_spec[field_name]) <= 1:
+                raise ValueError(f"Asset {resolved_spec['id']} field {field_name} must be in [0, 1].")
+        for field_name in ("contact_quantile", "ground_quantile"):
+            if not 0 < float(resolved_spec[field_name]) <= 1:
+                raise ValueError(f"Asset {resolved_spec['id']} field {field_name} must be in (0, 1].")
+        for field_name in ("ground_search_radius", "ground_vertical_band"):
+            if float(resolved_spec[field_name]) <= 0:
+                raise ValueError(f"Asset {resolved_spec['id']} field {field_name} must be positive.")
+        if int(resolved_spec["ground_min_points"]) < 3:
+            raise ValueError(f"Asset {resolved_spec['id']} field ground_min_points must be at least 3.")
         assets.append(resolved_spec)
     manifest["assets"] = assets
     manifest["_manifest_path"] = str(manifest_path)
@@ -394,6 +414,157 @@ def transform_asset_gaussians(
         "scales": asset["scales"] * local_scale * scene_scale,
         "quats": quats,
     }
+
+
+def snap_asset_placement_to_ground(
+    asset: dict[str, torch.Tensor],
+    spec: dict[str, Any],
+    frame_index: int,
+    initial_position_world: torch.Tensor,
+    scene_points_world: torch.Tensor,
+    scene_opacities: torch.Tensor,
+    down_direction_world: torch.Tensor,
+    scene_units_per_meter: float,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Move an asset only vertically until its opaque lower contour touches local ground."""
+    initial_position = torch.as_tensor(
+        initial_position_world,
+        device=asset["means"].device,
+        dtype=asset["means"].dtype,
+    )
+    down = torch.as_tensor(
+        down_direction_world,
+        device=initial_position.device,
+        dtype=initial_position.dtype,
+    )
+    down_norm = torch.linalg.vector_norm(down)
+    if not torch.isfinite(down_norm) or down_norm <= 1e-8:
+        raise ValueError("Ground snapping requires a finite non-zero down direction.")
+    down = down / down_norm
+    diagnostics: dict[str, Any] = {
+        "enabled": bool(spec["ground_snap"]),
+        "initial_world_coordinate_xyz": initial_position.detach().cpu().tolist(),
+        "down_direction_world_xyz": down.detach().cpu().tolist(),
+    }
+    if not spec["ground_snap"]:
+        diagnostics.update({"status": "disabled", "final_world_coordinate_xyz": diagnostics["initial_world_coordinate_xyz"]})
+        return initial_position, diagnostics
+
+    scene_scale = float(scene_units_per_meter)
+    scene_points = torch.as_tensor(scene_points_world, device=initial_position.device, dtype=initial_position.dtype)
+    opacities = torch.as_tensor(scene_opacities, device=initial_position.device, dtype=initial_position.dtype).reshape(-1)
+    if scene_points.ndim != 2 or scene_points.shape[1] != 3 or scene_points.shape[0] != opacities.shape[0]:
+        raise ValueError("Scene points and opacities must have shapes [N, 3] and [N].")
+
+    offsets = scene_points - initial_position
+    vertical_offsets = offsets @ down
+    horizontal_offsets = offsets - vertical_offsets[:, None] * down
+    horizontal_distances = torch.linalg.vector_norm(horizontal_offsets, dim=-1)
+    local_mask = (
+        torch.isfinite(scene_points).all(dim=-1)
+        & torch.isfinite(opacities)
+        & (opacities >= float(spec["ground_opacity_threshold"]))
+        & (horizontal_distances <= float(spec["ground_search_radius"]) * scene_scale)
+        & (vertical_offsets.abs() <= float(spec["ground_vertical_band"]) * scene_scale)
+    )
+    local_points = scene_points[local_mask]
+    minimum_points = int(spec["ground_min_points"])
+    diagnostics["local_scene_point_count"] = int(local_points.shape[0])
+    if local_points.shape[0] < minimum_points:
+        diagnostics.update(
+            {
+                "status": "fallback_insufficient_local_ground_points",
+                "final_world_coordinate_xyz": diagnostics["initial_world_coordinate_xyz"],
+            }
+        )
+        return initial_position, diagnostics
+
+    local_down_coordinates = local_points @ down
+    ground_cutoff = torch.quantile(local_down_coordinates, float(spec["ground_quantile"]))
+    ground_points = local_points[local_down_coordinates >= ground_cutoff]
+    if ground_points.shape[0] < 3:
+        diagnostics.update(
+            {
+                "status": "fallback_insufficient_ground_candidates",
+                "ground_candidate_count": int(ground_points.shape[0]),
+                "final_world_coordinate_xyz": diagnostics["initial_world_coordinate_xyz"],
+            }
+        )
+        return initial_position, diagnostics
+
+    reference_axis = torch.eye(3, device=down.device, dtype=down.dtype)[torch.argmin(down.abs())]
+    horizontal_x = torch.linalg.cross(down, reference_axis)
+    horizontal_x = horizontal_x / torch.linalg.vector_norm(horizontal_x)
+    horizontal_y = torch.linalg.cross(down, horizontal_x)
+    centered_ground = ground_points - initial_position
+    design = torch.stack(
+        (centered_ground @ horizontal_x, centered_ground @ horizontal_y, torch.ones_like(centered_ground[:, 0])),
+        dim=-1,
+    )
+    targets = ground_points @ down
+    inliers = torch.ones(ground_points.shape[0], dtype=torch.bool, device=ground_points.device)
+    coefficients = torch.linalg.lstsq(design, targets).solution
+    for _ in range(3):
+        residuals = targets - design @ coefficients
+        centered_residuals = residuals - torch.median(residuals[inliers])
+        mad = torch.median(centered_residuals[inliers].abs())
+        tolerance = torch.maximum(
+            3.0 * 1.4826 * mad,
+            torch.tensor(0.02 * scene_scale, device=mad.device, dtype=mad.dtype),
+        )
+        next_inliers = centered_residuals.abs() <= tolerance
+        if next_inliers.sum() < 3 or torch.equal(next_inliers, inliers):
+            break
+        inliers = next_inliers
+        coefficients = torch.linalg.lstsq(design[inliers], targets[inliers]).solution
+    ground_coordinate_down = coefficients[2]
+    ground_residuals = targets[inliers] - design[inliers] @ coefficients
+    if not torch.isfinite(ground_coordinate_down) or not torch.isfinite(ground_residuals).all():
+        diagnostics.update(
+            {
+                "status": "fallback_nonfinite_ground_fit",
+                "ground_candidate_count": int(ground_points.shape[0]),
+                "ground_inlier_count": int(inliers.sum().item()),
+                "final_world_coordinate_xyz": diagnostics["initial_world_coordinate_xyz"],
+            }
+        )
+        return initial_position, diagnostics
+
+    transform = _asset_transform_for_frame(spec, frame_index, initial_position.device)
+    if transform is None:
+        raise ValueError(f"Asset {spec['id']} is not active in localization frame {frame_index}.")
+    asset_mask = asset["opacities"] >= float(spec["contact_opacity_threshold"])
+    if not asset_mask.any():
+        asset_mask = torch.ones_like(asset["opacities"], dtype=torch.bool)
+    rotation = transform[:3, :3]
+    relative_asset_means = (
+        asset["means"][asset_mask]
+        * float(spec["scale"])
+        * scene_scale
+    ) @ rotation.transpose(0, 1)
+    asset_down_coordinates = relative_asset_means @ down
+    asset_bottom_offset = torch.quantile(asset_down_coordinates, float(spec["contact_quantile"]))
+    clearance = float(spec["ground_clearance_m"]) * scene_scale
+    current_bottom_coordinate = initial_position @ down + asset_bottom_offset
+    vertical_adjustment = ground_coordinate_down - clearance - current_bottom_coordinate
+    corrected_position = initial_position + vertical_adjustment * down
+
+    diagnostics.update(
+        {
+            "status": "snapped",
+            "ground_candidate_count": int(ground_points.shape[0]),
+            "ground_inlier_count": int(inliers.sum().item()),
+            "ground_coordinate_along_down": float(ground_coordinate_down.item()),
+            "ground_fit_rmse": float(torch.sqrt(torch.mean(ground_residuals.square())).item()),
+            "asset_contact_point_count": int(asset_mask.sum().item()),
+            "asset_bottom_offset_along_down": float(asset_bottom_offset.item()),
+            "vertical_adjustment_world_units": float(vertical_adjustment.item()),
+            "vertical_adjustment_m": float(vertical_adjustment.item() / scene_scale),
+            "ground_clearance_m": float(spec["ground_clearance_m"]),
+            "final_world_coordinate_xyz": corrected_position.detach().cpu().tolist(),
+        }
+    )
+    return corrected_position, diagnostics
 
 
 def get_assets_for_frame(

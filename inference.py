@@ -23,10 +23,10 @@ from third_party.TAPIP3D.utils.inference_utils import load_model, read_video, in
 from dggt.models.vggt import VGGT
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
-from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets
+from dggt.utils.assets import get_assets_for_frame, load_asset_manifest, load_manifest_assets, snap_asset_placement_to_ground
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
-from dggt.utils.vlm_point_localization import create_qwen_client, localize_corresponding_points_in_frame
+from dggt.utils.vlm_point_localization import create_qwen_client, localize_corresponding_points_in_frame, save_localization_results
 from gsplat.rendering import rasterization
 from datasets.dataset import ImageDirectoryDataset, WaymoOpenDataset, load_and_preprocess_images
 from utils.interplation import interp_all
@@ -1159,14 +1159,54 @@ def main():
                                     f"Last-frame localization found {len(correspondences)} point(s), but scene "
                                     f"{scene_name} has {len(matching_asset_specs)} manifest asset(s)."
                                 )
-                            localized_asset_points = {
-                                spec["id"]: torch.tensor(
+                            localization_static_mask = static_mask[:, localization_idx]
+                            localization_scene_points = point_map[:, localization_idx][
+                                localization_static_mask
+                            ].reshape(-1, 3)
+                            _, localization_scene_opacity, _, _ = get_split_gs(
+                                gs_map[:, localization_idx], localization_static_mask
+                            )
+                            localization_scene_dynamic = dy_map[:, localization_idx][
+                                localization_static_mask
+                            ].sigmoid()
+                            localization_scene_opacity = (
+                                localization_scene_opacity * (1 - localization_scene_dynamic)
+                            )
+                            bird_rotation = birds_eye_extrinsic[localization_frame_idx, :3, :3]
+                            down_direction_world = bird_rotation.transpose(0, 1) @ torch.tensor(
+                                [0.0, 0.0, 1.0],
+                                device=device,
+                                dtype=extrinsic.dtype,
+                            )
+                            localized_asset_points = {}
+                            for spec, correspondence in zip(matching_asset_specs, correspondences):
+                                initial_position = torch.tensor(
                                     correspondence["world_coordinate_xyz"],
                                     device=device,
                                     dtype=extrinsic.dtype,
                                 )
-                                for spec, correspondence in zip(matching_asset_specs, correspondences)
-                            }
+                                corrected_position, ground_snap = snap_asset_placement_to_ground(
+                                    asset=asset_cache[spec["_asset_path"]],
+                                    spec=spec,
+                                    frame_index=localization_frame_idx,
+                                    initial_position_world=initial_position,
+                                    scene_points_world=localization_scene_points,
+                                    scene_opacities=localization_scene_opacity,
+                                    down_direction_world=down_direction_world,
+                                    scene_units_per_meter=asset_scene_scale,
+                                )
+                                localized_asset_points[spec["id"]] = corrected_position
+                                correspondence["asset_id"] = spec["id"]
+                                correspondence["ground_snap"] = ground_snap
+                                correspondence["world_coordinate_xyz"] = ground_snap[
+                                    "final_world_coordinate_xyz"
+                                ]
+                                print(
+                                    f"Ground snap for asset {spec['id']}: {ground_snap['status']}, "
+                                    f"vertical adjustment={ground_snap.get('vertical_adjustment_m', 0.0):+.4f}m, "
+                                    f"local points={ground_snap.get('local_scene_point_count', 0)}"
+                                )
+                            save_localization_results(localization, localization_output_path)
                             print(
                                 f"Localized {len(localized_asset_points)} last-frame asset placement point(s) "
                                 f"for scene {scene_name}: {localization_output_path}"

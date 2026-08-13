@@ -150,6 +150,24 @@ When `--render_birds_eye` is enabled, inference writes both `source_camera_rende
 
 The results for each scene are written to `vlm_point_detections.json`. It records the selected last-frame index, both 2D selections, the bird's-eye epipolar line, the triangulated world coordinate, and the closest-ray error. Last-frame visualizations are saved under `vlm_point_visualizations/`.
 
+By default, each localized asset is also snapped vertically to the last frame's local static ground surface. Low-opacity scene and asset Gaussians are ignored, a robust local ground plane is fitted, and the asset's opaque lower contour is moved into contact with that plane. Horizontal placement is unchanged. The manifest accepts these optional per-asset settings:
+
+```json
+{
+  "ground_snap": true,
+  "contact_opacity_threshold": 0.05,
+  "contact_quantile": 0.99,
+  "ground_opacity_threshold": 0.05,
+  "ground_quantile": 0.75,
+  "ground_search_radius": 1.5,
+  "ground_vertical_band": 1.5,
+  "ground_min_points": 32,
+  "ground_clearance_m": 0.0
+}
+```
+
+Distances in `ground_search_radius`, `ground_vertical_band`, and `ground_clearance_m` are meters. Set `ground_snap` to `false` to keep the raw triangulated height. Ground fitting status, point counts, residual, original position, vertical adjustment, and final position are recorded under each correspondence's `ground_snap` field in `vlm_point_detections.json`.
+
 Install the optional client dependency and set an API key first:
 
 ```bash

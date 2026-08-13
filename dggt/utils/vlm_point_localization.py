@@ -108,9 +108,14 @@ def localize_corresponding_points_in_frame(
         "coordinate_frame": "dggt_world_xyz",
         "correspondences": correspondences,
     }
+    save_localization_results(results, output_path)
+    return results
+
+
+def save_localization_results(results: dict[str, Any], output_path: str | Path) -> None:
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return results
 
 
 def _pixel_ray(pixel: Any, extrinsic: torch.Tensor, intrinsic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
