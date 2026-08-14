@@ -4,9 +4,12 @@ open3d
 gsplat
 lpips
 scikit-image
-transformers
+# PyTorch 2.4.1 (pinned in the installation instructions) does not expose
+# torch.distributed.tensor.DTensor, which newer Transformers releases import.
+transformers==4.46.3
 imageio-ffmpeg
-diffusers
+# Recent Diffusers releases require PyTorch custom-op APIs introduced after 2.4.
+diffusers==0.30.3
 typed-argument-parser
 hydra-core
 einops
@@ -26,7 +29,8 @@ pillow
 pyarrow
 tensorboard
 trimesh
-huggingface_hub
+# Transformers 4.46.3 and tokenizers 0.20.3 require huggingface-hub < 1.
+huggingface_hub==0.26.5
 python-box[all]~=7.0
 timm
 wandb
