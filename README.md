@@ -216,14 +216,21 @@ And download vggt pretrained model [here](https://huggingface.co/facebook/VGGT-1
 You can train the model on the Waymo Open dataset.
 ```bash
 torchrun --nproc_per_node=1 --master_port=0000 train.py \
+  --image_dir /path/to/processed_waymo \
   --log_dir logs/xxx \
-  --ckpt_path /path/to/pretrained_checkpoint.pth 
+  --ckpt_path /path/to/pretrained_checkpoint.pth \
+  --sky_model cubemap \
+  --scene_names_file /path/to/processed_scene_names.txt
 ```
 
     --image_dir <path>: Path to the Waymo dataset directory containing processed training data (required).
     --log_dir <path>: Directory where training logs, checkpoints, and visualizations will be saved (required).
     --ckpt_path <path>: Path to the pretrained model checkpoint to initialize weights (required).
     --sequence_length <length>: Number of input frames for each training iteration, defaulting to 4 (optional).
+    --sky_model <cubemap|gaussian>: Train the new world-aligned cubemap sky or the legacy Gaussian sky.
+    --scene_names / --scene_names_file: Select processed Waymo scene directories; the file contains one directory name per line.
+
+The cubemap model reuses all compatible weights from the original checkpoint and initializes only `sky_head.*` from scratch. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
 
 
 ### Zero-shot and trained experiment​s

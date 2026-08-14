@@ -12,6 +12,11 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 
+
+OPENCV2WAYMO = np.array(
+    [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=np.float32
+)
+
 def resize_flow(flow, target_size):
     height, width = flow.shape[-3:-1]
     if (height, width) == target_size:
@@ -135,6 +140,51 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
             images = images.unsqueeze(0)
 
     return images
+
+
+def load_waymo_calibrations(scene_dir, image_paths):
+    """Load calibrations in the same flattened order and transform intrinsics with image preprocessing."""
+    image_metadata = []
+    for path in image_paths:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        frame_id, camera_id = stem.rsplit("_", maxsplit=1)
+        with Image.open(path) as image:
+            width, height = image.size
+        new_width = 518
+        new_height = round(height * (new_width / width) / 14) * 14
+        output_height = min(new_height, 518)
+        image_metadata.append((frame_id, int(camera_id), width, height, new_height, output_height))
+
+    max_height = max(metadata[-1] for metadata in image_metadata)
+    intrinsics, camera_to_worlds = [], []
+    origin_frame = image_metadata[0][0]
+    origin_ego_pose = np.loadtxt(os.path.join(scene_dir, "ego_pose", f"{origin_frame}.txt"))
+
+    for frame_id, camera_id, width, height, new_height, output_height in image_metadata:
+        raw_intrinsics = np.loadtxt(os.path.join(scene_dir, "intrinsics", f"{camera_id}.txt"))
+        fx, fy, cx, cy = raw_intrinsics[:4]
+        scale_x = 518.0 / width
+        scale_y = new_height / height
+        crop_top = max((new_height - 518) // 2, 0)
+        pad_top = (max_height - output_height) // 2
+        intrinsic = np.array(
+            [
+                [fx * scale_x, 0.0, cx * scale_x],
+                [0.0, fy * scale_y, cy * scale_y - crop_top + pad_top],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+
+        camera_to_ego = np.loadtxt(os.path.join(scene_dir, "extrinsics", f"{camera_id}.txt"))
+        camera_to_ego = camera_to_ego @ OPENCV2WAYMO
+        ego_pose = np.loadtxt(os.path.join(scene_dir, "ego_pose", f"{frame_id}.txt"))
+        ego_to_local_world = np.linalg.inv(origin_ego_pose) @ ego_pose
+        camera_to_world = ego_to_local_world @ camera_to_ego
+        intrinsics.append(intrinsic)
+        camera_to_worlds.append(camera_to_world.astype(np.float32))
+
+    return torch.from_numpy(np.stack(intrinsics)), torch.from_numpy(np.stack(camera_to_worlds))
 
 
 class ImageDirectoryDataset(Dataset):
@@ -811,6 +861,10 @@ class WaymoOpenDataset(Dataset):
             "timestamps": timestamps,
             "interval": intervals,
         }
+        scene_dir = os.path.join(self.image_dir, self.scenes[idx])
+        input_dict["intrinsics"], input_dict["camera_to_worlds"] = load_waymo_calibrations(
+            scene_dir, sequence_paths
+        )
 
         dynamic_mask_paths = self.dynamic_mask_path[idx]
         selected_indices = target_indices if target_indices is not None else indices
@@ -820,8 +874,12 @@ class WaymoOpenDataset(Dataset):
             )
 
         if target_indices is not None:
-            input_dict["targets"] = load_and_preprocess_images(self._flatten_paths(image_paths, target_indices))
+            target_paths = self._flatten_paths(image_paths, target_indices)
+            input_dict["targets"] = load_and_preprocess_images(target_paths)
             input_dict["target_masks"] = load_and_preprocess_images(self._flatten_paths(sky_mask_paths, target_indices))
+            input_dict["target_intrinsics"], input_dict["target_camera_to_worlds"] = load_waymo_calibrations(
+                scene_dir, target_paths
+            )
 
         depth_paths = self.depth_flow_paths[idx]
         if depth_paths:

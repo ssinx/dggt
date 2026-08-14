@@ -14,6 +14,7 @@ from dggt.heads.dpt_head import DPTHead, GaussianHead
 from dggt.heads.track_head import TrackHead
 from dggt.heads.gs_head import GaussianDecoder
 from dggt.models.sky import SkyGaussian
+from dggt.heads.sky_cubemap_head import SkyCubemapHead
 from dggt.models.fusion import PointNetGSFusion
 #from dggt.splatformer.feature_predictor import FeaturePredictor
 
@@ -36,6 +37,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.semantic_head = DPTHead(dim_in= embed_dim, output_dim = semantic_num + 1, activation="linear")# ,down_ratio=2)#RGB
         # Color, opacity, scale, rotation
         self.sky_model = SkyGaussian()
+        self.sky_head = SkyCubemapHead(token_dim=3 * embed_dim, patch_size=patch_size)
         #self.fusion_model = PointNetGSFusion()
         #self.splatformer = FeaturePredictor()
         #self.point_offset_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log_1")
@@ -45,6 +47,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self,
         images: torch.Tensor,
         query_points: torch.Tensor = None,
+        intrinsics: torch.Tensor = None,
+        camera_to_worlds: torch.Tensor = None,
     ):
         # If without batch dimension, add it
         if len(images.shape) == 4:
@@ -92,6 +96,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
+            if self.sky_head is not None and intrinsics is not None and camera_to_worlds is not None:
+                predictions["sky_cubemap"] = self.sky_head(
+                    image_tokens_list,
+                    images,
+                    intrinsics,
+                    camera_to_worlds,
+                    patch_start_idx,
+                )
+
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
                 aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
@@ -103,6 +116,5 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions["images"] = images
 
         return predictions
-
 
 

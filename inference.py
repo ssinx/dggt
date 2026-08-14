@@ -34,6 +34,7 @@ from dggt.utils.assets import (
     snap_asset_placement_to_ground,
 )
 from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
+from dggt.utils.cubemap import render_cubemap
 from dggt.utils.visual_track import visualize_tracks_on_images
 from dggt.utils.vlm_point_localization import (
     create_qwen_client,
@@ -651,6 +652,12 @@ def main():
     parser.add_argument('-metrics', action='store_true', help='Whether to output evaluation metrics')
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
+    parser.add_argument(
+        '--sky_model',
+        choices=['cubemap', 'gaussian'],
+        default='gaussian',
+        help='Sky representation stored in the checkpoint',
+    )
     parser.add_argument('--render_all_cameras', action='store_true', help='Render all five Waymo cameras from the selected single-camera input')
     parser.add_argument(
         '--render_birds_eye',
@@ -783,6 +790,13 @@ def main():
             parser.error('--birds_eye_height must be positive')
         if args.render_all_cameras:
             parser.error('--render_birds_eye cannot be combined with --render_all_cameras')
+    if args.sky_model == 'cubemap' and plain_image_inference:
+        parser.error('--sky_model cubemap requires Waymo camera calibration and is unavailable with --plain_image_dir')
+    if args.sky_model == 'cubemap' and (args.render_all_cameras or args.render_birds_eye):
+        parser.error(
+            '--sky_model cubemap currently supports standard mode 2/3 rendering only; '
+            'cross-coordinate alignment is required for all-camera or bird\'s-eye rendering'
+        )
 
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -837,7 +851,23 @@ def main():
 
     model = VGGT().to(device)
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint, strict=True)
+    incompatible = model.load_state_dict(checkpoint, strict=False)
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if args.sky_model == 'cubemap':
+        missing_sky = sorted(key for key in missing if key.startswith('sky_head.'))
+        if missing_sky:
+            raise RuntimeError(
+                'The selected checkpoint does not contain a trained cubemap sky head. '
+                'Train with --sky_model cubemap or select --sky_model gaussian. '
+                f'First missing key: {missing_sky[0]}'
+            )
+    allowed_missing_prefix = 'sky_head.' if args.sky_model == 'gaussian' else 'sky_model.'
+    disallowed_missing = sorted(key for key in missing if not key.startswith(allowed_missing_prefix))
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            f'Checkpoint mismatch: missing={disallowed_missing[:5]}, unexpected={sorted(unexpected)[:5]}'
+        )
     if args.mode == 3:
         track_ckpt = 'path_to_track_model'
         track_model = load_model(track_ckpt)
@@ -859,10 +889,17 @@ def main():
 
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
+            gt_intrinsics = batch.get('intrinsics')
+            camera_to_worlds = batch.get('camera_to_worlds')
+            if gt_intrinsics is not None:
+                gt_intrinsics = gt_intrinsics.to(device)
+                camera_to_worlds = camera_to_worlds.to(device)
             
             if args.mode == 3:
                 target_images = batch['targets'].to(device)
                 target_sky_masks = batch['target_masks'].to(device)
+                target_gt_intrinsics = batch['target_intrinsics'].to(device)
+                target_camera_to_worlds = batch['target_camera_to_worlds'].to(device)
 
             start_time = time.time()
             dynamic = False
@@ -871,7 +908,11 @@ def main():
                 dynamic_masks = batch['dynamic_mask'].to(device)[:, :, 0, :, :]
 
             with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model(images)
+                predictions = model(
+                    images,
+                    intrinsics=gt_intrinsics if args.sky_model == 'cubemap' else None,
+                    camera_to_worlds=camera_to_worlds if args.sky_model == 'cubemap' else None,
+                )
                 H, W = images.shape[-2:]
                 extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions['pose_enc'], (H, W))
                 extrinsic = extrinsics[0]
@@ -1768,7 +1809,20 @@ def main():
                     depth_maps = renders[..., -1]
                     renders = renders[..., :-1]
                     alphas = torch.cat(chunked_alphas, dim=0)
-                    if args.mode == 3:
+                    if args.sky_model == 'cubemap':
+                        if args.mode == 3:
+                            bg_render = render_cubemap(
+                                predictions['sky_cubemap'],
+                                target_gt_intrinsics,
+                                target_camera_to_worlds,
+                                H,
+                                W,
+                            )[0]
+                        else:
+                            bg_render = render_cubemap(
+                                predictions['sky_cubemap'], gt_intrinsics, camera_to_worlds, H, W
+                            )[0]
+                    elif args.mode == 3:
                         bg_render = model.sky_model.forward_with_new_pose(
                             images,
                             origin_extrinsic,
@@ -1785,7 +1839,7 @@ def main():
                         )
                     renders = alphas * renders + (1 - alphas) * bg_render
                     rendered_image = renders.permute(0, 3, 1, 2)
-                    target_image = images[0]
+                    target_image = target_images[0] if args.mode == 3 else images[0]
 
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)

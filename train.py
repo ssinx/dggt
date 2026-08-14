@@ -16,6 +16,7 @@ from dggt.utils.load_fn import load_and_preprocess_images
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import palette_10, concat_list, get_split_gs, gs_dict,get_gs_items,downsample_3dgs
+from dggt.utils.cubemap import render_cubemap
 from gsplat.rendering import rasterization
 from datasets.dataset import WaymoOpenDataset
 import torch.distributed as dist
@@ -47,7 +48,23 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--use_splatformer', type=bool, default=False)
     parser.add_argument('--downsample_3dgs', type=bool, default=False)
+    parser.add_argument('--sky_model', choices=['cubemap', 'gaussian'], default='cubemap')
+    parser.add_argument('--sky_rgb_weight', type=float, default=1.0)
+    parser.add_argument('--scene_names', nargs='+', help='Processed Waymo scene directory names')
+    parser.add_argument('--scene_names_file', help='Text file containing one processed scene name per line')
     return parser.parse_args()
+
+
+def resolve_scene_names(args):
+    if args.scene_names and args.scene_names_file:
+        raise ValueError('Use only one of --scene_names and --scene_names_file')
+    if args.scene_names_file:
+        with open(args.scene_names_file, encoding='utf-8') as scene_file:
+            scene_names = [line.strip() for line in scene_file if line.strip() and not line.lstrip().startswith('#')]
+        if not scene_names:
+            raise ValueError(f'No scene names found in {args.scene_names_file}')
+        return scene_names
+    return args.scene_names or [str(scene_id).zfill(3) for scene_id in range(300, 600)]
 
 def main(args):
     dist.init_process_group(backend='nccl')
@@ -56,7 +73,13 @@ def main(args):
     device = torch.device("cuda", args.local_rank)
     dtype = torch.float32
     
-    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1)
+    dataset = WaymoOpenDataset(
+        args.image_dir,
+        scene_names=resolve_scene_names(args),
+        sequence_length=args.sequence_length,
+        mode=1,
+        views=1,
+    )
     sampler = DistributedSampler(dataset,shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
 
@@ -81,7 +104,8 @@ def main(args):
 
     for param in model.module.parameters():
         param.requires_grad = False
-    for head_name in ["gs_head","instance_head","sky_model" ]: #, "gs_head","instance_head","sky_model", "semantic_head"
+    sky_module_name = "sky_head" if args.sky_model == "cubemap" else "sky_model"
+    for head_name in ["gs_head", "instance_head", sky_module_name]:
         for param in getattr(model.module, head_name).parameters():
             param.requires_grad = True
 
@@ -89,7 +113,7 @@ def main(args):
         {'params': model.module.gs_head.parameters(), 'lr': 4e-5},
         # {'params': model.module.semantic_head.parameters(), 'lr': 1e-4},
         {'params': model.module.instance_head.parameters(), 'lr': 4e-5},
-        {'params': model.module.sky_model.parameters(), 'lr': 1e-4},
+        {'params': getattr(model.module, sky_module_name).parameters(), 'lr': 1e-4},
     ], weight_decay=1e-4)
 
     warmup_iterations = 1000
@@ -106,6 +130,8 @@ def main(args):
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
+            gt_intrinsics = batch['intrinsics'].to(device)
+            camera_to_worlds = batch['camera_to_worlds'].to(device)
 
             if 'dynamic_mask' in batch:
                 dynamic_masks = batch['dynamic_mask'].to(device)[:, :, 0, :, :]
@@ -113,7 +139,11 @@ def main(args):
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model(images)
+                predictions = model(
+                    images,
+                    intrinsics=gt_intrinsics if args.sky_model == "cubemap" else None,
+                    camera_to_worlds=camera_to_worlds if args.sky_model == "cubemap" else None,
+                )
                 H, W = images.shape[-2:]
                 extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions['pose_enc'], (H, W))
                 extrinsic = extrinsics[0]
@@ -184,7 +214,12 @@ def main(args):
 
                 renders = torch.cat(chunked_renders, dim=0)
                 alphas = torch.cat(chunked_alphas, dim=0)
-                bg_render = model.module.sky_model(images, extrinsic, intrinsic)
+                if args.sky_model == "cubemap":
+                    bg_render = render_cubemap(
+                        predictions["sky_cubemap"], gt_intrinsics, camera_to_worlds, H, W
+                    )[0]
+                else:
+                    bg_render = model.module.sky_model(images, extrinsic, intrinsic)
                 renders = alphas * renders + (1 - alphas) * bg_render
 
                 rendered_image = renders.permute(0, 3, 1, 2)
@@ -195,6 +230,11 @@ def main(args):
 
 
                 loss = F.l1_loss(rendered_image, target_image)
+
+                sky_pixels = sky_mask[0, ..., :1].mean(dim=-1, keepdim=True)
+                sky_rgb_error = (bg_render - target_image.permute(0, 2, 3, 1)).abs()
+                sky_rgb_loss = (sky_rgb_error * sky_pixels).sum() / (3.0 * sky_pixels.sum().clamp_min(1.0))
+                loss += args.sky_rgb_weight * sky_rgb_loss
 
                 sky_mask_loss = F.l1_loss(alphas, 1 - sky_mask[0, ..., 0][..., None])
                 loss +=  sky_mask_loss
@@ -228,7 +268,10 @@ def main(args):
 
         if args.local_rank == 0 and step % 1 == 0:
             print(f"[{step}/{args.max_epoch}] Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()}")
-            print(f"[{step}/{args.max_epoch}]   sky Loss: {sky_mask_loss.item():.4f} | LR: {scheduler.get_last_lr()}")
+            print(
+                f"[{step}/{args.max_epoch}]   sky alpha Loss: {sky_mask_loss.item():.4f} | "
+                f"sky RGB Loss: {sky_rgb_loss.item():.4f}"
+            )
 
         if args.local_rank == 0 and step % args.save_image == 0:
             random_frame_idx = random.randint(0, rendered_image.shape[0] - 1)
