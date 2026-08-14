@@ -227,10 +227,10 @@ torchrun --nproc_per_node=1 --master_port=0000 train.py \
     --log_dir <path>: Directory where training logs, checkpoints, and visualizations will be saved (required).
     --ckpt_path <path>: Path to the pretrained model checkpoint to initialize weights (required).
     --sequence_length <length>: Number of input frames for each training iteration, defaulting to 4 (optional).
-    --sky_model <cubemap|gaussian>: Train the new world-aligned cubemap sky or the legacy Gaussian sky.
+    --sky_model cubemap: Train the new world-aligned cubemap sky head; this training entry point rejects the legacy Gaussian mode.
     --scene_names / --scene_names_file: Select processed Waymo scene directories; the file contains one directory name per line.
 
-The cubemap model reuses all compatible weights from the original checkpoint and initializes only `sky_head.*` from scratch. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
+The cubemap training entry point freezes the complete checkpoint and trains only `sky_head.*`. An old checkpoint may omit `sky_head.*`, which is then initialized from scratch; missing frozen DGGT weights are treated as an error. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
 
 
 ### Zero-shot and trained experiment​s

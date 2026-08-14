@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import random
 import torch
 import torch.nn.functional as F
@@ -8,24 +9,18 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-from IPython import embed
 import lpips
 
 from dggt.models.vggt import VGGT
-from dggt.utils.load_fn import load_and_preprocess_images
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
-from dggt.utils.gs import palette_10, concat_list, get_split_gs, gs_dict,get_gs_items,downsample_3dgs
+from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.cubemap import render_cubemap
 from gsplat.rendering import rasterization
 from datasets.dataset import WaymoOpenDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-import time
 
-
-def compute_lifespan_loss(gamma):
-    return torch.mean(torch.abs(1 / (gamma + 1e-6)))
 
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
     sigma = torch.log(torch.tensor(gamma1)).to(gamma0.device) /  ((gamma0)**2 + 1e-6)
@@ -66,6 +61,53 @@ def resolve_scene_names(args):
         return scene_names
     return args.scene_names or [str(scene_id).zfill(3) for scene_id in range(300, 600)]
 
+
+def load_checkpoint_for_sky_training(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        checkpoint = checkpoint["model"]
+
+    if checkpoint and all(key.startswith("module.") for key in checkpoint):
+        checkpoint = {key.removeprefix("module."): value for key, value in checkpoint.items()}
+
+    incompatible = model.load_state_dict(checkpoint, strict=False)
+    missing_sky = sorted(key for key in incompatible.missing_keys if key.startswith("sky_head."))
+    missing_non_sky = sorted(key for key in incompatible.missing_keys if not key.startswith("sky_head."))
+    if missing_non_sky or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint is incompatible with frozen DGGT modules: "
+            f"missing={missing_non_sky[:10]}, unexpected={incompatible.unexpected_keys[:10]}"
+        )
+    return missing_sky
+
+
+def configure_sky_only_training(model):
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.sky_head.parameters():
+        parameter.requires_grad_(True)
+
+    model.eval()
+    model.sky_head.train()
+
+    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable_names or any(not name.startswith("sky_head.") for name in trainable_names):
+        raise RuntimeError(f"Expected only sky_head parameters to be trainable, got {trainable_names[:10]}")
+    return trainable_names
+
+
+def verify_sky_only_gradients(model):
+    sky_has_gradient = False
+    for name, parameter in model.named_parameters():
+        if name.startswith("sky_head."):
+            sky_has_gradient = sky_has_gradient or parameter.grad is not None
+        elif parameter.grad is not None:
+            raise RuntimeError(f"Frozen parameter unexpectedly received a gradient: {name}")
+    if not sky_has_gradient:
+        raise RuntimeError("No sky_head parameter received a gradient")
+
 def main(args):
     dist.init_process_group(backend='nccl')
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -88,41 +130,38 @@ def main(args):
         os.makedirs(os.path.join(args.log_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(args.log_dir, "ckpt"), exist_ok=True)
 
+    if args.sky_model != "cubemap":
+        raise ValueError("Sky-only training requires --sky_model cubemap")
+
     model = VGGT().to(device)
-    checkpoint = torch.load(args.ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint, strict=False)
+    missing_sky = load_checkpoint_for_sky_training(model, args.ckpt_path)
+    trainable_names = configure_sky_only_training(model)
+    if args.local_rank == 0:
+        if missing_sky:
+            print(f"Initialized {len(missing_sky)} sky_head tensors from scratch")
+        else:
+            print("Resuming sky_head weights from checkpoint")
+        print(f"Training {len(trainable_names)} sky_head parameter tensors only")
 
-    model.train()
-    model = DDP(model, device_ids=[args.local_rank]) #, find_unused_parameters=True)
-    model._set_static_graph()
-    
-    lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
+    # requires_grad must be finalized before DDP constructs its gradient reducer.
+    model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=False)
 
+    lpips_loss_fn = lpips.LPIPS(net='alex').to(device).eval()
+    for parameter in lpips_loss_fn.parameters():
+        parameter.requires_grad_(False)
 
-    binary_loss_fn = torch.nn.BCEWithLogitsLoss(reduction='mean')
-    semantic_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=255)
+    optimizer = AdamW(model.module.sky_head.parameters(), lr=1e-4, weight_decay=1e-4)
 
-    for param in model.module.parameters():
-        param.requires_grad = False
-    sky_module_name = "sky_head" if args.sky_model == "cubemap" else "sky_model"
-    for head_name in ["gs_head", "instance_head", sky_module_name]:
-        for param in getattr(model.module, head_name).parameters():
-            param.requires_grad = True
-
-    optimizer = AdamW([
-        {'params': model.module.gs_head.parameters(), 'lr': 4e-5},
-        # {'params': model.module.semantic_head.parameters(), 'lr': 1e-4},
-        {'params': model.module.instance_head.parameters(), 'lr': 4e-5},
-        {'params': getattr(model.module, sky_module_name).parameters(), 'lr': 1e-4},
-    ], weight_decay=1e-4)
-
-    warmup_iterations = 1000
+    total_iterations = max(1, args.max_epoch * len(dataloader))
+    warmup_iterations = min(1000, max(1, total_iterations // 20))
     scheduler = LambdaLR(
         optimizer,
-        lr_lambda=lambda step: min((step + 1) / warmup_iterations, 1.0) * 0.5 * (
-            1 + torch.cos(torch.tensor(torch.pi * step / args.max_epoch)))
+        lr_lambda=lambda iteration: min((iteration + 1) / warmup_iterations, 1.0) * 0.5 * (
+            1 + math.cos(math.pi * min(iteration, total_iterations) / total_iterations)
+        ),
     )
 
+    global_iteration = 0
     for step in tqdm(range(args.max_epoch)):
         sampler.set_epoch(step)        
         for batch in dataloader:
@@ -133,10 +172,7 @@ def main(args):
             gt_intrinsics = batch['intrinsics'].to(device)
             camera_to_worlds = batch['camera_to_worlds'].to(device)
 
-            if 'dynamic_mask' in batch:
-                dynamic_masks = batch['dynamic_mask'].to(device)[:, :, 0, :, :]
-            
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(dtype=dtype):
                 predictions = model(
@@ -161,7 +197,6 @@ def main(args):
                 gs_map = predictions["gs_map"]
                 gs_conf = predictions["gs_conf"]
                 dy_map = predictions["dynamic_conf"].squeeze(-1) #B,H,W,1
-                semantic_logits = predictions["semantic_logits"]  #road, building, car, truck, person, bicycle, sky, vegetation
 
                 static_mask = torch.ones_like(bg_mask)
                 static_points = point_map[static_mask].reshape(-1, 3)
@@ -229,48 +264,32 @@ def main(args):
                 ####################### Loss ###########################
 
 
-                loss = F.l1_loss(rendered_image, target_image)
+                render_l1_loss = F.l1_loss(rendered_image, target_image)
 
-                sky_pixels = sky_mask[0, ..., :1].mean(dim=-1, keepdim=True)
+                sky_pixels = sky_mask[0, ..., :1].clamp(0, 1)
                 sky_rgb_error = (bg_render - target_image.permute(0, 2, 3, 1)).abs()
                 sky_rgb_loss = (sky_rgb_error * sky_pixels).sum() / (3.0 * sky_pixels.sum().clamp_min(1.0))
-                loss += args.sky_rgb_weight * sky_rgb_loss
 
+                # Gaussian alpha is frozen; this metric diagnoses foreground leakage only.
                 sky_mask_loss = F.l1_loss(alphas, 1 - sky_mask[0, ..., 0][..., None])
-                loss +=  sky_mask_loss
-
-                gs_conf_loss = compute_lifespan_loss(static_gs_conf)
-                loss += 0.01 * gs_conf_loss
-                
-                #dynamic mask loss
-                if 'dynamic_mask' in batch:
-                    dynamic_loss = binary_loss_fn(dy_map[0], dynamic_masks[0].float())
-                else:
-                    dynamic_loss =  binary_loss_fn(dy_map[0], torch.zeros_like(dy_map[0]))
-
-
-                loss = loss + 0.05 * dynamic_loss  # loss +
-
-                # #### semantic segmenation ####
-                # if 'semantic_mask' in batch:
-                #     gt_sem_mask = batch['semantic_mask'][0,:,0,...].to(device)
-                #     #calculate loss
-                #     semantic_loss = semantic_loss_fn(semantic_logits[0].permute(0, 3, 1, 2), gt_sem_mask.long())
-                #     loss = loss + 0.01 * semantic_loss
-
-                if step >= 0:
-                    lpips_val = lpips_loss_fn(rendered_image, target_image)
-                    loss += 0.05 * min(step / 1000, 1.0) * lpips_val.mean() # *
+                lpips_val = lpips_loss_fn(rendered_image, target_image).mean()
+                lpips_weight = 0.05 * min(global_iteration / 1000, 1.0)
+                loss = render_l1_loss + args.sky_rgb_weight * sky_rgb_loss + lpips_weight * lpips_val
 
             loss.backward()
+            if global_iteration == 0:
+                verify_sky_only_gradients(model.module)
+            torch.nn.utils.clip_grad_norm_(model.module.sky_head.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
+            global_iteration += 1
 
         if args.local_rank == 0 and step % 1 == 0:
             print(f"[{step}/{args.max_epoch}] Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()}")
             print(
-                f"[{step}/{args.max_epoch}]   sky alpha Loss: {sky_mask_loss.item():.4f} | "
-                f"sky RGB Loss: {sky_rgb_loss.item():.4f}"
+                f"[{step}/{args.max_epoch}] render L1: {render_l1_loss.item():.4f} | "
+                f"sky RGB: {sky_rgb_loss.item():.4f} | LPIPS: {lpips_val.item():.4f} | "
+                f"frozen alpha diagnostic: {sky_mask_loss.item():.4f}"
             )
 
         if args.local_rank == 0 and step % args.save_image == 0:
@@ -279,14 +298,16 @@ def main(args):
             rendered = rendered_image[random_frame_idx].detach().cpu().clamp(0, 1)
             target = target_image[random_frame_idx].detach().cpu().clamp(0, 1)
 
-            dy_map_sigmoid = torch.sigmoid(dy_map[0, random_frame_idx]).detach().cpu()  # shape: (H, W)
-            dy_map_rgb = dy_map_sigmoid.unsqueeze(0).repeat(3, 1, 1)  # [3, H, W]
+            sky = bg_render[random_frame_idx].detach().cpu().permute(2, 0, 1).clamp(0, 1)
+            alpha_rgb = alphas[random_frame_idx, ..., 0].unsqueeze(0).repeat(3, 1, 1).cpu()
 
-            sem_rgb = alphas[random_frame_idx, ..., 0].unsqueeze(0).repeat(3, 1, 1).cpu()  # [3, H, W]
-
-            combined = torch.cat([target, rendered, dy_map_rgb, sem_rgb], dim=-1) 
+            combined = torch.cat([target, rendered, sky, alpha_rgb], dim=-1)
 
             T.ToPILImage()(combined).save(os.path.join(args.log_dir, "images", f"step_{step}_frame_{random_frame_idx}.png"))
+            cubemap_strip = torch.cat(
+                [face for face in predictions["sky_cubemap"][0].detach().cpu().clamp(0, 1)], dim=-1
+            )
+            T.ToPILImage()(cubemap_strip).save(os.path.join(args.log_dir, "images", f"step_{step}_cubemap.png"))
         
         if args.local_rank == 0 and step > 0 and step % args.save_ckpt == 0:
             ckpt_path = os.path.join(args.log_dir, "ckpt", f"model_latest.pt")
