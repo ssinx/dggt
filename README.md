@@ -231,7 +231,7 @@ torchrun --nproc_per_node=1 --master_port=0000 train.py \
     --sky_model cubemap: Train the new world-aligned cubemap sky head; this training entry point rejects the legacy Gaussian mode.
     --scene_names / --scene_names_file: Select processed Waymo scene directories; the file contains one directory name per line.
 
-The cubemap training entry point freezes the complete checkpoint and trains only `sky_head.*`. An old checkpoint may omit `sky_head.*`, which is then initialized from scratch; missing frozen DGGT weights are treated as an error. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
+The cubemap sky head follows Instant NuRec's resolution split: ray-conditioned queries attend to scene tokens on a patch grid, then a four-scale DPT reassemble/fusion decoder produces full-resolution cubemap faces. Decoder activation checkpointing is enabled during training to limit memory use. The training entry point freezes the complete checkpoint and trains only `sky_head.*`. A checkpoint with a missing or architecturally incompatible `sky_head.*` restarts only the sky head; all frozen DGGT weights must still match. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
 
 To avoid materializing a processed Waymo copy, train directly from the v2 modular
 Parquet split. With neither `--scene_names` nor `--scene_names_file`, every

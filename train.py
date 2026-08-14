@@ -103,13 +103,27 @@ def load_checkpoint_for_sky_training(model, checkpoint_path):
     if checkpoint and all(key.startswith("module.") for key in checkpoint):
         checkpoint = {key.removeprefix("module."): value for key, value in checkpoint.items()}
 
+    model_state = model.state_dict()
+    checkpoint_sky = {key: value for key, value in checkpoint.items() if key.startswith("sky_head.")}
+    model_sky_keys = {key for key in model_state if key.startswith("sky_head.")}
+    sky_is_compatible = set(checkpoint_sky) == model_sky_keys and all(
+        model_state[key].shape == value.shape for key, value in checkpoint_sky.items()
+    )
+    if checkpoint_sky and not sky_is_compatible:
+        # Architecture migrations intentionally restart only the sky decoder;
+        # every frozen checkpoint tensor must still match below.
+        checkpoint = {key: value for key, value in checkpoint.items() if not key.startswith("sky_head.")}
+
     incompatible = model.load_state_dict(checkpoint, strict=False)
     missing_sky = sorted(key for key in incompatible.missing_keys if key.startswith("sky_head."))
     missing_non_sky = sorted(key for key in incompatible.missing_keys if not key.startswith("sky_head."))
-    if missing_non_sky or incompatible.unexpected_keys:
+    unexpected_non_sky = sorted(
+        key for key in incompatible.unexpected_keys if not key.startswith("sky_head.")
+    )
+    if missing_non_sky or unexpected_non_sky:
         raise RuntimeError(
             "Checkpoint is incompatible with frozen DGGT modules: "
-            f"missing={missing_non_sky[:10]}, unexpected={incompatible.unexpected_keys[:10]}"
+            f"missing={missing_non_sky[:10]}, unexpected={unexpected_non_sky[:10]}"
         )
     return missing_sky
 

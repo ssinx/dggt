@@ -22,6 +22,7 @@ def test_sky_cubemap_head_shape_and_gradient():
         depth=1,
         cubemap_size=16,
         query_size=2,
+        dpt_features=16,
     )
 
     cubemap = head([tokens], images, intrinsics, camera_to_worlds, patch_start_idx)
@@ -29,3 +30,24 @@ def test_sky_cubemap_head_shape_and_gradient():
     assert cubemap.min() >= 0 and cubemap.max() <= 1
     cubemap.mean().backward()
     assert head.token_projection.weight.grad is not None
+    assert head.upsampler.fusion1.output_projection.weight.grad is not None
+
+
+def test_sky_cubemap_head_eval_without_checkpointing():
+    head = SkyCubemapHead(
+        token_dim=24,
+        embed_dim=32,
+        num_heads=4,
+        cubemap_size=24,
+        query_size=2,
+        dpt_features=16,
+    ).eval()
+    tokens = torch.randn(1, 1, 6, 24)
+    images = torch.rand(1, 1, 3, 28, 28)
+    intrinsics = torch.tensor([[[[20.0, 0.0, 14.0], [0.0, 20.0, 14.0], [0.0, 0.0, 1.0]]]])
+    camera_to_worlds = torch.eye(4).view(1, 1, 4, 4)
+
+    with torch.no_grad():
+        cubemap = head([tokens], images, intrinsics, camera_to_worlds, patch_start_idx=2)
+
+    assert cubemap.shape == (1, 6, 3, 24, 24)
