@@ -17,7 +17,7 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.cubemap import render_cubemap
 from gsplat.rendering import rasterization
-from datasets.dataset import WaymoOpenDataset
+from datasets.dataset import WaymoOpenDataset, WaymoParquetSkyDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -31,14 +31,32 @@ def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_dir', type=str, default="")
-    parser.add_argument('--ckpt_path', type=str, default='')
+    parser.add_argument('--ckpt_path', type=str, default='pretrained/model_latest_waymo.pt')
     parser.add_argument('--log_dir', type=str, default='logs/xxx')
-    parser.add_argument('--sequence_length', type=int, default=4)#8,4
+    parser.add_argument(
+        '--sequence_length', type=int, default=4,
+        help='Frames per sample for processed-data mode',
+    )
+    parser.add_argument(
+        '--raw_sequence_lengths', type=int, nargs='+', default=[4, 8, 12],
+        help='Candidate interval lengths sampled per raw Waymo scene (default: 4 8 12)',
+    )
+    parser.add_argument(
+        '--raw_fixed_start', type=int,
+        help='Fix the raw-scene interval start index; intended for deterministic overfit tests',
+    )
     parser.add_argument('--chunk_size', type=int, default=4)
     parser.add_argument('--max_epoch', type=int, default=50000)
-    parser.add_argument('--save_image', type=int, default=100)
-    parser.add_argument('--save_ckpt', type=int, default=100)
+    parser.add_argument(
+        '--save_image', type=int, default=50,
+        help='Save non-overwriting training visualizations every N optimizer steps (default: 50)',
+    )
+    parser.add_argument(
+        '--save_ckpt', type=int, default=50,
+        help='Update model_latest.pt and, when improved, model_best.pt every N optimizer steps (default: 50)',
+    )
     parser.add_argument('--gamma', type=float, default=0.9)
+    parser.add_argument('--log_every', type=int, default=10, help='Print and record metrics every N optimizer steps')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--use_splatformer', type=bool, default=False)
@@ -47,10 +65,19 @@ def parse_args():
     parser.add_argument('--sky_rgb_weight', type=float, default=1.0)
     parser.add_argument('--scene_names', nargs='+', help='Processed Waymo scene directory names')
     parser.add_argument('--scene_names_file', help='Text file containing one processed scene name per line')
+    parser.add_argument('--raw_waymo_dir', help='Waymo v2 split directory containing component Parquet folders')
+    parser.add_argument(
+        '--sky_mask_cache_dir', default='/scratch/junyizh3/waymo_sky_masks',
+        help='Directory for persistent, uncompressed uint8 SegFormer sky masks',
+    )
+    parser.add_argument('--segformer_python', default='/data/user_data/junyizh3/miniconda3/envs/segformer/bin/python')
+    parser.add_argument('--segformer_path', default='/data/user_data/junyizh3/projects/SegFormer')
+    parser.add_argument('--segformer_config', default='/data/user_data/junyizh3/projects/SegFormer/local_configs/segformer/B5/segformer.b5.1024x1024.city.160k.py')
+    parser.add_argument('--segformer_checkpoint', default='/data/user_data/junyizh3/projects/SegFormer/checkpoints/segformer.b5.1024x1024.city.160k.pth')
     return parser.parse_args()
 
 
-def resolve_scene_names(args):
+def resolve_scene_names(args, default_all=False):
     if args.scene_names and args.scene_names_file:
         raise ValueError('Use only one of --scene_names and --scene_names_file')
     if args.scene_names_file:
@@ -59,7 +86,11 @@ def resolve_scene_names(args):
         if not scene_names:
             raise ValueError(f'No scene names found in {args.scene_names_file}')
         return scene_names
-    return args.scene_names or [str(scene_id).zfill(3) for scene_id in range(300, 600)]
+    if args.scene_names:
+        return args.scene_names
+    # Raw modular Waymo discovers every Parquet segment when no explicit
+    # subset is requested. Keep the legacy processed-data default unchanged.
+    return None if default_all else [str(scene_id).zfill(3) for scene_id in range(300, 600)]
 
 
 def load_checkpoint_for_sky_training(model, checkpoint_path):
@@ -108,6 +139,45 @@ def verify_sky_only_gradients(model):
     if not sky_has_gradient:
         raise RuntimeError("No sky_head parameter received a gradient")
 
+
+def save_training_checkpoint(model, log_dir, global_iteration, checkpoint_name):
+    """Atomically replace a named rolling checkpoint to limit disk usage."""
+    checkpoint_dir = os.path.join(log_dir, "ckpt")
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
+    temporary_path = f"{checkpoint_path}.tmp"
+    torch.save(model.module.state_dict(), temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+    print(f"[Checkpoint] Saved iteration {global_iteration} to {checkpoint_path}")
+
+
+def save_training_images(log_dir, global_iteration, rendered_image, target_image,
+                         bg_render, alphas, sky_cubemap):
+    """Save one visualization pair without replacing artifacts from an earlier run."""
+    images_dir = os.path.join(log_dir, "images")
+    artifact_stem = f"iteration_{global_iteration:09d}"
+    suffix = 0
+    while True:
+        unique_stem = artifact_stem if suffix == 0 else f"{artifact_stem}_{suffix}"
+        frame_path = os.path.join(images_dir, f"{unique_stem}_frame.png")
+        cubemap_path = os.path.join(images_dir, f"{unique_stem}_cubemap.png")
+        if not os.path.exists(frame_path) and not os.path.exists(cubemap_path):
+            break
+        suffix += 1
+
+    random_frame_idx = random.randint(0, rendered_image.shape[0] - 1)
+    rendered = rendered_image[random_frame_idx].detach().cpu().clamp(0, 1)
+    target = target_image[random_frame_idx].detach().cpu().clamp(0, 1)
+    sky = bg_render[random_frame_idx].detach().cpu().permute(2, 0, 1).clamp(0, 1)
+    alpha_rgb = alphas[random_frame_idx, ..., 0].unsqueeze(0).repeat(3, 1, 1).cpu()
+    combined = torch.cat([target, rendered, sky, alpha_rgb], dim=-1)
+    T.ToPILImage()(combined).save(frame_path)
+
+    cubemap_strip = torch.cat(
+        [face for face in sky_cubemap[0].detach().cpu().clamp(0, 1)], dim=-1
+    )
+    T.ToPILImage()(cubemap_strip).save(cubemap_path)
+    print(f"[Images] Saved iteration {global_iteration} to {frame_path} and {cubemap_path}")
+
 def main(args):
     dist.init_process_group(backend='nccl')
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -115,20 +185,66 @@ def main(args):
     device = torch.device("cuda", args.local_rank)
     dtype = torch.float32
     
-    dataset = WaymoOpenDataset(
-        args.image_dir,
-        scene_names=resolve_scene_names(args),
-        sequence_length=args.sequence_length,
-        mode=1,
-        views=1,
-    )
-    sampler = DistributedSampler(dataset,shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
+    scene_names = resolve_scene_names(args, default_all=args.raw_waymo_dir is not None)
+    if args.raw_waymo_dir:
+        dataset = WaymoParquetSkyDataset(
+            args.raw_waymo_dir,
+            scene_names=scene_names,
+            sequence_lengths=args.raw_sequence_lengths,
+            fixed_start=args.raw_fixed_start,
+            segformer_python=args.segformer_python,
+            segformer_path=args.segformer_path,
+            segformer_config=args.segformer_config,
+            segformer_checkpoint=args.segformer_checkpoint,
+            segformer_device=f"cuda:{args.local_rank}",
+            sky_mask_cache_dir=args.sky_mask_cache_dir,
+        )
+        # Windows are grouped by segment so each worker can reuse its small
+        # in-memory Parquet cache. Every window is still visited every epoch.
+        sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        dataset = WaymoOpenDataset(
+            args.image_dir,
+            scene_names=scene_names,
+            sequence_length=args.sequence_length,
+            mode=1,
+            views=1,
+        )
+        sampler = DistributedSampler(dataset, shuffle=True)
+    if args.local_rank == 0:
+        if args.raw_waymo_dir:
+            print(
+                f"Training dataset: {len(dataset)} scenes/steps per epoch, "
+                f"random interval length from {args.raw_sequence_lengths}"
+            )
+        else:
+            print(f"Training dataset: {len(dataset)} samples, {args.sequence_length} frames per sample")
+    # Online SegFormer owns one persistent CUDA subprocess and therefore must
+    # be called from the main process, not forked DataLoader workers.
+    dataloader_workers = 0 if args.raw_waymo_dir else 4
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=dataloader_workers)
 
+    tensorboard_writer = None
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         os.makedirs(os.path.join(args.log_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(args.log_dir, "ckpt"), exist_ok=True)
+        metrics_path = os.path.join(args.log_dir, "metrics.csv")
+        if not os.path.exists(metrics_path):
+            with open(metrics_path, "w", encoding="utf-8") as metrics_file:
+                metrics_file.write("iteration,epoch,loss,render_l1,sky_rgb,lpips,alpha_diagnostic,lr\n")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as error:
+            raise ImportError(
+                "TensorBoard logging requires the `tensorboard` package. "
+                "Install it with `pip install tensorboard`."
+            ) from error
+        tensorboard_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, "tensorboard"))
+        # Make the dashboard immediately observable while the checkpoint,
+        # SegFormer, and first training batch are still loading.
+        tensorboard_writer.add_scalar("run/started", 1.0, 0)
+        tensorboard_writer.flush()
 
     if args.sky_model != "cubemap":
         raise ValueError("Sky-only training requires --sky_model cubemap")
@@ -162,11 +278,24 @@ def main(args):
     )
 
     global_iteration = 0
-    for step in tqdm(range(args.max_epoch)):
+    best_checkpoint_loss = float("inf")
+    progress = tqdm(
+        total=total_iterations,
+        desc="Training sky cubemap",
+        unit="step",
+        disable=args.local_rank != 0,
+        dynamic_ncols=True,
+    )
+    for step in range(args.max_epoch):
         sampler.set_epoch(step)        
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
+            sky_mask_valid = batch.get('sky_mask_valid')
+            if sky_mask_valid is None:
+                sky_mask_valid = torch.ones(sky_mask.shape[:2], device=device)
+            else:
+                sky_mask_valid = sky_mask_valid.to(device)
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
             gt_intrinsics = batch['intrinsics'].to(device)
@@ -267,6 +396,7 @@ def main(args):
                 render_l1_loss = F.l1_loss(rendered_image, target_image)
 
                 sky_pixels = sky_mask[0, ..., :1].clamp(0, 1)
+                sky_pixels = sky_pixels * sky_mask_valid[0, :, None, None, None]
                 sky_rgb_error = (bg_render - target_image.permute(0, 2, 3, 1)).abs()
                 sky_rgb_loss = (sky_rgb_error * sky_pixels).sum() / (3.0 * sky_pixels.sum().clamp_min(1.0))
 
@@ -283,36 +413,53 @@ def main(args):
             optimizer.step()
             scheduler.step()
             global_iteration += 1
-
-        if args.local_rank == 0 and step % 1 == 0:
-            print(f"[{step}/{args.max_epoch}] Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()}")
-            print(
-                f"[{step}/{args.max_epoch}] render L1: {render_l1_loss.item():.4f} | "
-                f"sky RGB: {sky_rgb_loss.item():.4f} | LPIPS: {lpips_val.item():.4f} | "
-                f"frozen alpha diagnostic: {sky_mask_loss.item():.4f}"
-            )
-
-        if args.local_rank == 0 and step % args.save_image == 0:
-            random_frame_idx = random.randint(0, rendered_image.shape[0] - 1)
-
-            rendered = rendered_image[random_frame_idx].detach().cpu().clamp(0, 1)
-            target = target_image[random_frame_idx].detach().cpu().clamp(0, 1)
-
-            sky = bg_render[random_frame_idx].detach().cpu().permute(2, 0, 1).clamp(0, 1)
-            alpha_rgb = alphas[random_frame_idx, ..., 0].unsqueeze(0).repeat(3, 1, 1).cpu()
-
-            combined = torch.cat([target, rendered, sky, alpha_rgb], dim=-1)
-
-            T.ToPILImage()(combined).save(os.path.join(args.log_dir, "images", f"step_{step}_frame_{random_frame_idx}.png"))
-            cubemap_strip = torch.cat(
-                [face for face in predictions["sky_cubemap"][0].detach().cpu().clamp(0, 1)], dim=-1
-            )
-            T.ToPILImage()(cubemap_strip).save(os.path.join(args.log_dir, "images", f"step_{step}_cubemap.png"))
+            if args.local_rank == 0:
+                progress.update(1)
+                current_loss = loss.item()
+                current_sky_loss = sky_rgb_loss.item()
+                current_lr = scheduler.get_last_lr()[0]
+                progress.set_postfix(
+                    loss=f"{current_loss:.4f}",
+                    sky=f"{current_sky_loss:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    refresh=True,
+                )
+                tensorboard_writer.add_scalar("loss/total", current_loss, global_iteration)
+                tensorboard_writer.add_scalar("loss/sky_rgb", current_sky_loss, global_iteration)
+                tensorboard_writer.add_scalar("loss/render_l1", render_l1_loss.item(), global_iteration)
+                tensorboard_writer.add_scalar("loss/lpips", lpips_val.item(), global_iteration)
+                tensorboard_writer.add_scalar(
+                    "diagnostic/alpha_sky_mask", sky_mask_loss.item(), global_iteration
+                )
+                tensorboard_writer.add_scalar("optimizer/learning_rate", current_lr, global_iteration)
+                if global_iteration == 1 or (args.log_every > 0 and global_iteration % args.log_every == 0):
+                    with open(metrics_path, "a", encoding="utf-8") as metrics_file:
+                        metrics_file.write(
+                            f"{global_iteration},{step},{current_loss:.8f},"
+                            f"{render_l1_loss.item():.8f},{sky_rgb_loss.item():.8f},"
+                            f"{lpips_val.item():.8f},{sky_mask_loss.item():.8f},{current_lr:.10g}\n"
+                        )
+                    tensorboard_writer.flush()
+            if args.local_rank == 0:
+                if args.save_image > 0 and global_iteration % args.save_image == 0:
+                    save_training_images(
+                        args.log_dir, global_iteration, rendered_image, target_image,
+                        bg_render, alphas, predictions["sky_cubemap"],
+                    )
+                if args.save_ckpt > 0 and global_iteration % args.save_ckpt == 0:
+                    save_training_checkpoint(model, args.log_dir, global_iteration, "model_latest.pt")
+                    if current_loss < best_checkpoint_loss:
+                        best_checkpoint_loss = current_loss
+                        save_training_checkpoint(model, args.log_dir, global_iteration, "model_best.pt")
+                        print(f"[Checkpoint] New best loss: {best_checkpoint_loss:.8f}")
         
-        if args.local_rank == 0 and step > 0 and step % args.save_ckpt == 0:
-            ckpt_path = os.path.join(args.log_dir, "ckpt", f"model_latest.pt")
-            torch.save(model.module.state_dict(), ckpt_path)
-            print(f"[Checkpoint] Saved model at step {step} to {ckpt_path}")
+    if args.local_rank == 0:
+        progress.close()
+        save_training_checkpoint(model, args.log_dir, global_iteration, "model_latest.pt")
+        tensorboard_writer.flush()
+        tensorboard_writer.close()
+    if hasattr(dataset, "close"):
+        dataset.close()
 
 if __name__ == "__main__":
     args = parse_args()

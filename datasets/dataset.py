@@ -4,6 +4,11 @@ import torchvision.transforms as T
 from torch.optim import Adam
 import os
 import re
+import io
+import pickle
+import struct
+import subprocess
+from collections import OrderedDict
 from IPython import embed
 from torch.utils.data import Dataset, DataLoader
 import random
@@ -11,6 +16,7 @@ import open3d as o3d
 from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
+from tqdm import tqdm
 
 
 OPENCV2WAYMO = np.array(
@@ -76,8 +82,9 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     # First process all images and collect their shapes
     for image_path in image_path_list:
 
-        # Open image
-        img = Image.open(image_path)
+        # Accept paths/file objects as before, plus already-decoded PIL images
+        # used by the streaming Parquet dataset.
+        img = image_path.copy() if isinstance(image_path, Image.Image) else Image.open(image_path)
 
         # If there's an alpha channel, blend onto white background:
         if img.mode == "RGBA":
@@ -140,6 +147,336 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
             images = images.unsqueeze(0)
 
     return images
+
+
+class WaymoParquetSkyDataset(Dataset):
+    """Stream one random temporal interval per Waymo v2 scene and epoch.
+
+    No decoded images or masks are written to disk. Interval length is sampled
+    from ``sequence_lengths`` independently whenever a scene is fetched.
+    """
+
+    IMAGE_COLUMN = "[CameraImageComponent].image"
+    SEGMENTATION_COLUMN = "[CameraSegmentationLabelComponent].panoptic_label"
+    DIVISOR_COLUMN = "[CameraSegmentationLabelComponent].panoptic_label_divisor"
+    POSE_COLUMN = "[VehiclePoseComponent].world_from_vehicle.transform"
+    EXTRINSIC_COLUMN = "[CameraCalibrationComponent].extrinsic.transform"
+    INTRINSIC_COLUMNS = tuple(
+        f"[CameraCalibrationComponent].intrinsic.{name}" for name in ("f_u", "f_v", "c_u", "c_v")
+    )
+    TIMESTAMP_COLUMN = "key.frame_timestamp_micros"
+    CAMERA_COLUMN = "key.camera_name"
+    # Waymo camera segmentation enum: TYPE_SKY = 25.
+    SKY_CLASS_ID = 25
+
+    def __init__(
+        self, raw_dir, scene_names=None, sequence_lengths=(4, 8, 12), fixed_start=None,
+        camera_name=1, cache_segments=2,
+        segformer_python=None, segformer_path=None, segformer_config=None,
+        segformer_checkpoint=None, segformer_device="cuda:0", sky_mask_cache_dir=None,
+    ):
+        sequence_lengths = tuple(int(length) for length in sequence_lengths)
+        if not sequence_lengths or any(length < 1 for length in sequence_lengths):
+            raise ValueError("sequence_lengths must contain positive integers")
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as error:
+            raise ImportError(
+                "Raw Waymo v2 training requires pyarrow. Install it with `pip install pyarrow`."
+            ) from error
+
+        self.pq = pq
+        self.raw_dir = os.path.abspath(raw_dir)
+        self.sequence_lengths = sequence_lengths
+        self.fixed_start = fixed_start
+        if fixed_start is not None and fixed_start < 0:
+            raise ValueError("fixed_start must be non-negative")
+        self.camera_name = camera_name
+        self.cache_segments = max(1, cache_segments)
+        self._cache = OrderedDict()
+        self.sky_mask_cache_dir = (
+            os.path.abspath(sky_mask_cache_dir) if sky_mask_cache_dir else None
+        )
+        if self.sky_mask_cache_dir:
+            os.makedirs(self.sky_mask_cache_dir, exist_ok=True)
+        self._segformer_process = None
+        self.segformer_command = None
+        if segformer_python:
+            required = (segformer_path, segformer_config, segformer_checkpoint)
+            if any(value is None for value in required):
+                raise ValueError("SegFormer python, repository, config, and checkpoint must be provided together")
+            worker_script = os.path.join(os.path.dirname(__file__), "tools", "segformer_stream.py")
+            self.segformer_command = [
+                segformer_python, worker_script,
+                "--segformer_path", segformer_path,
+                "--config", segformer_config,
+                "--checkpoint", segformer_checkpoint,
+                "--device", segformer_device,
+            ]
+
+        component_dirs = ("camera_image", "camera_calibration", "vehicle_pose")
+        for component in component_dirs:
+            directory = os.path.join(self.raw_dir, component)
+            if not os.path.isdir(directory):
+                raise FileNotFoundError(f"Missing Waymo v2 component directory: {directory}")
+
+        filenames = sorted(name for name in os.listdir(os.path.join(self.raw_dir, "camera_image")) if name.endswith(".parquet"))
+        if scene_names:
+            selected = []
+            for name in scene_names:
+                if str(name).isdigit() and len(str(name)) <= 3:
+                    index = int(name)
+                    if index >= len(filenames):
+                        raise IndexError(f"Raw Waymo scene index {index} is outside 0..{len(filenames) - 1}")
+                    selected.append(filenames[index])
+                else:
+                    filename = str(name) if str(name).endswith(".parquet") else f"{name}.parquet"
+                    if filename not in filenames:
+                        raise FileNotFoundError(f"Unknown Waymo segment: {name}")
+                    selected.append(filename)
+            filenames = selected
+        if not filenames:
+            raise ValueError(f"No Waymo Parquet segments selected under {self.raw_dir}")
+
+        self.segments = []
+        self.segment_timestamps = {}
+        self.segment_frame_counts = {}
+        for filename in tqdm(filenames, desc="Indexing Waymo Parquet segments", unit="segment"):
+            image_path = self._path("camera_image", filename)
+            image_keys = self._camera_timestamps(image_path)
+            timestamps = sorted(image_keys)
+            valid_lengths = tuple(length for length in self.sequence_lengths if length <= len(timestamps))
+            if not valid_lengths:
+                continue
+            self.segments.append(filename)
+            self.segment_timestamps[filename] = timestamps
+            self.segment_frame_counts[filename] = len(timestamps)
+        if not self.segments:
+            raise ValueError("No Waymo scenes contain enough images for the requested sequence lengths")
+
+    def _path(self, component, filename):
+        return os.path.join(self.raw_dir, component, filename)
+
+    def _camera_timestamps(self, path):
+        table = self.pq.read_table(path, columns=[self.TIMESTAMP_COLUMN, self.CAMERA_COLUMN])
+        timestamps = table[self.TIMESTAMP_COLUMN].to_pylist()
+        cameras = table[self.CAMERA_COLUMN].to_pylist()
+        return {timestamp for timestamp, camera in zip(timestamps, cameras) if camera == self.camera_name}
+
+    def _load_segment(self, filename):
+        if filename in self._cache:
+            self._cache.move_to_end(filename)
+            return self._cache[filename]
+
+        def rows(component, columns, camera=True):
+            requested = [self.TIMESTAMP_COLUMN, *columns]
+            if camera:
+                requested.append(self.CAMERA_COLUMN)
+            table = self.pq.read_table(self._path(component, filename), columns=requested)
+            result = {}
+            for row_index, timestamp in enumerate(table[self.TIMESTAMP_COLUMN].to_pylist()):
+                if not camera or table[self.CAMERA_COLUMN][row_index].as_py() == self.camera_name:
+                    result[timestamp] = tuple(table[column][row_index].as_py() for column in columns)
+            return result
+
+        calibration_table = self.pq.read_table(
+            self._path("camera_calibration", filename),
+            columns=[self.CAMERA_COLUMN, *self.INTRINSIC_COLUMNS, self.EXTRINSIC_COLUMN],
+        )
+        calibration = None
+        for row_index, camera in enumerate(calibration_table[self.CAMERA_COLUMN].to_pylist()):
+            if camera == self.camera_name:
+                intrinsic = [calibration_table[column][row_index].as_py() for column in self.INTRINSIC_COLUMNS]
+                extrinsic = np.asarray(calibration_table[self.EXTRINSIC_COLUMN][row_index].as_py(), dtype=np.float64).reshape(4, 4)
+                calibration = (intrinsic, extrinsic)
+                break
+        if calibration is None:
+            raise RuntimeError(f"Camera {self.camera_name} has no calibration in {filename}")
+
+        data = {
+            "filename": filename,
+            "images": rows("camera_image", [self.IMAGE_COLUMN]),
+            "poses": rows("vehicle_pose", [self.POSE_COLUMN], camera=False),
+            "calibration": calibration,
+            "generated_sky_masks": {},
+        }
+        self._cache[filename] = data
+        while len(self._cache) > self.cache_segments:
+            self._cache.popitem(last=False)
+        return data
+
+    def _ensure_segformer(self):
+        if self.segformer_command is None:
+            raise RuntimeError("Online SegFormer was not configured")
+        if self._segformer_process is None:
+            self._segformer_process = subprocess.Popen(
+                self.segformer_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                bufsize=0,
+            )
+        if self._segformer_process.poll() is not None:
+            raise RuntimeError(f"SegFormer worker exited with code {self._segformer_process.returncode}")
+        return self._segformer_process
+
+    @staticmethod
+    def _write_pipe_message(stream, value):
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        stream.write(struct.pack("!Q", len(payload)))
+        stream.write(payload)
+        stream.flush()
+
+    @staticmethod
+    def _read_pipe_message(stream):
+        def read_exact(size):
+            chunks = []
+            remaining = size
+            while remaining:
+                chunk = stream.read(remaining)
+                if not chunk:
+                    raise RuntimeError(f"SegFormer pipe closed with {remaining} bytes still expected")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        header = read_exact(8)
+        if len(header) != 8:
+            raise RuntimeError("SegFormer worker closed its output pipe")
+        size = struct.unpack("!Q", header)[0]
+        payload = read_exact(size)
+        return pickle.loads(payload)
+
+    def _generate_sky_masks(self, segment, timestamps):
+        cache = segment["generated_sky_masks"]
+        filename = segment["filename"]
+        if self.sky_mask_cache_dir:
+            segment_dir = os.path.join(
+                self.sky_mask_cache_dir, os.path.splitext(filename)[0]
+            )
+            os.makedirs(segment_dir, exist_ok=True)
+            for timestamp in timestamps:
+                if timestamp in cache:
+                    continue
+                mask_path = os.path.join(segment_dir, f"{timestamp}.npy")
+                if not os.path.isfile(mask_path):
+                    continue
+                try:
+                    mask = np.load(mask_path, allow_pickle=False)
+                    if mask.ndim != 2:
+                        raise ValueError(f"expected a 2D mask, got {mask.shape}")
+                    cache[timestamp] = (mask != 0).astype(np.uint8, copy=False)
+                except (OSError, ValueError, EOFError) as error:
+                    print(f"Ignoring invalid cached sky mask {mask_path}: {error}")
+
+        missing = [timestamp for timestamp in timestamps if timestamp not in cache]
+        # Keep protocol messages and peak host memory small. SegFormer itself
+        # still runs one image at a time inside the persistent worker.
+        request_size = 4
+        for start in range(0, len(missing), request_size):
+            requested = missing[start : start + request_size]
+            process = self._ensure_segformer()
+            self._write_pipe_message(process.stdin, [segment["images"][timestamp][0] for timestamp in requested])
+            try:
+                response = self._read_pipe_message(process.stdout)
+            except RuntimeError as error:
+                return_code = process.poll()
+                raise RuntimeError(
+                    f"SegFormer worker communication failed (exit_code={return_code}): {error}"
+                ) from error
+            if "error" in response:
+                raise RuntimeError(f"Online SegFormer failed: {response['error']}")
+            for timestamp, mask in zip(requested, response["masks"]):
+                mask = (np.asarray(mask) != 0).astype(np.uint8, copy=False)
+                cache[timestamp] = mask
+                if self.sky_mask_cache_dir:
+                    mask_path = os.path.join(segment_dir, f"{timestamp}.npy")
+                    temporary_path = f"{mask_path}.tmp.{os.getpid()}"
+                    try:
+                        with open(temporary_path, "wb") as mask_file:
+                            np.save(mask_file, mask, allow_pickle=False)
+                            mask_file.flush()
+                            os.fsync(mask_file.fileno())
+                        os.replace(temporary_path, mask_path)
+                    finally:
+                        if os.path.exists(temporary_path):
+                            os.unlink(temporary_path)
+        return [cache[timestamp] for timestamp in timestamps]
+
+    def close(self):
+        process = getattr(self, "_segformer_process", None)
+        if process is not None and process.poll() is None:
+            try:
+                self._write_pipe_message(process.stdin, "stop")
+                process.wait(timeout=5)
+            except Exception:
+                process.terminate()
+
+    def __del__(self):
+        self.close()
+
+    def __len__(self):
+        # One randomly sampled temporal interval per scene and epoch.
+        return len(self.segments)
+
+    @staticmethod
+    def _preprocess_calibration(intrinsic, image_size, output_height):
+        width, height = image_size
+        new_height = round(height * (518.0 / width) / 14) * 14
+        crop_top = max((new_height - 518) // 2, 0)
+        pad_top = (output_height - min(new_height, 518)) // 2
+        fx, fy, cx, cy = intrinsic
+        return np.array(
+            [[fx * 518.0 / width, 0, cx * 518.0 / width],
+             [0, fy * new_height / height, cy * new_height / height - crop_top + pad_top],
+             [0, 0, 1]], dtype=np.float32,
+        )
+
+    def __getitem__(self, index):
+        filename = self.segments[index]
+        scene_timestamps = self.segment_timestamps[filename]
+        valid_lengths = [length for length in self.sequence_lengths if length <= len(scene_timestamps)]
+        sequence_length = random.choice(valid_lengths)
+        if self.fixed_start is None:
+            start = random.randint(0, len(scene_timestamps) - sequence_length)
+        else:
+            start = self.fixed_start
+            if start + sequence_length > len(scene_timestamps):
+                raise IndexError(
+                    f"Fixed interval {start}:{start + sequence_length} exceeds "
+                    f"the {len(scene_timestamps)} frames in {filename}"
+                )
+        timestamps = tuple(scene_timestamps[start : start + sequence_length])
+        segment = self._load_segment(filename)
+        image_objects = [Image.open(io.BytesIO(segment["images"][timestamp][0])).convert("RGB") for timestamp in timestamps]
+        images = load_and_preprocess_images(image_objects)
+
+        generated_masks = self._generate_sky_masks(segment, timestamps)
+        mask_objects = [Image.fromarray(mask * 255, mode="L") for mask in generated_masks]
+        masks = load_and_preprocess_images(mask_objects)
+
+        intrinsic_values, camera_to_vehicle = segment["calibration"]
+        output_height = images.shape[-2]
+        intrinsics = np.stack([
+            self._preprocess_calibration(intrinsic_values, image.size, output_height) for image in image_objects
+        ])
+        origin_pose = np.asarray(segment["poses"][timestamps[0]][0], dtype=np.float64).reshape(4, 4)
+        camera_to_vehicle = camera_to_vehicle @ OPENCV2WAYMO
+        camera_to_worlds = []
+        for timestamp in timestamps:
+            world_from_vehicle = np.asarray(segment["poses"][timestamp][0], dtype=np.float64).reshape(4, 4)
+            camera_to_worlds.append((np.linalg.inv(origin_pose) @ world_from_vehicle @ camera_to_vehicle).astype(np.float32))
+
+        relative_timestamps = np.asarray(timestamps, dtype=np.float64) - timestamps[0]
+        relative_timestamps = relative_timestamps / max(relative_timestamps[-1], 1.0) * (sequence_length / 4)
+        return {
+            "images": images,
+            "masks": masks,
+            "sky_mask_valid": torch.ones(len(timestamps), dtype=torch.float32),
+            "timestamps": torch.from_numpy(relative_timestamps.astype(np.float32)),
+            "intrinsics": torch.from_numpy(intrinsics),
+            "camera_to_worlds": torch.from_numpy(np.stack(camera_to_worlds)),
+            "image_paths": [f"{filename}:{timestamp}:{self.camera_name}" for timestamp in timestamps],
+        }
 
 
 def load_waymo_calibrations(scene_dir, image_paths):

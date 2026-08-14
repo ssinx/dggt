@@ -1,0 +1,8 @@
+data
+outputs
+*.pyc
+third_party
+pretrained
+logs
+slurm-*.out
+slurm-*.err

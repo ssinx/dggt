@@ -226,11 +226,66 @@ torchrun --nproc_per_node=1 --master_port=0000 train.py \
     --image_dir <path>: Path to the Waymo dataset directory containing processed training data (required).
     --log_dir <path>: Directory where training logs, checkpoints, and visualizations will be saved (required).
     --ckpt_path <path>: Path to the pretrained model checkpoint to initialize weights (required).
-    --sequence_length <length>: Number of input frames for each training iteration, defaulting to 4 (optional).
+    --sequence_length <length>: Frames per sample in processed-data mode, defaulting to 4.
+    --raw_sequence_lengths <lengths...>: Candidate contiguous interval lengths in raw Parquet mode, defaulting to `4 8 12`. Each epoch samples one interval per scene.
     --sky_model cubemap: Train the new world-aligned cubemap sky head; this training entry point rejects the legacy Gaussian mode.
     --scene_names / --scene_names_file: Select processed Waymo scene directories; the file contains one directory name per line.
 
 The cubemap training entry point freezes the complete checkpoint and trains only `sky_head.*`. An old checkpoint may omit `sky_head.*`, which is then initialized from scratch; missing frozen DGGT weights are treated as an error. Standard Waymo inference must also pass `--sky_model cubemap`; use `--sky_model gaussian` with legacy checkpoints.
+
+To avoid materializing a processed Waymo copy, train directly from the v2 modular
+Parquet split. With neither `--scene_names` nor `--scene_names_file`, every
+segment in the split is used. Those options are only for debugging or subset
+training; numeric names are zero-based indices into the sorted segment filenames,
+and full segment names are also accepted. Each epoch samples one randomly
+positioned contiguous interval from every scene using `camera_image`,
+`camera_calibration`, and `vehicle_pose` without writing decoded data to disk.
+Waymo supplies camera segmentation for only about 20 of roughly 200 frames per
+segment. In raw mode, every decoded image is instead sent through the configured
+SegFormer-B5 process to produce a Cityscapes sky mask. Newly generated masks are
+kept in the small in-memory segment cache and also atomically written as
+uncompressed binary `uint8` NumPy arrays under `--sky_mask_cache_dir` (default:
+`/scratch/junyizh3/waymo_sky_masks`). Later epochs and restarted jobs on the
+same compute node load those files and skip SegFormer. On this cluster,
+`/scratch` is node-local NVMe storage, so the same path on a different node does
+not contain the same files. At original Waymo resolution, caching every frame
+can require roughly 365 GiB.
+
+```bash
+torchrun --nproc_per_node=1 --master_port=29500 train.py \
+  --raw_waymo_dir /data/datasets/waymo/waymo-open-dataset-v2.0.1/training \
+  --sky_mask_cache_dir /scratch/junyizh3/waymo_sky_masks \
+  --image_dir '' \
+  --ckpt_path pretrained/model_latest_waymo.pt \
+  --log_dir logs/sky_only \
+  --sky_model cubemap \
+  --raw_sequence_lengths 4 8 12 --batch_size 1 --max_epoch 1000 \
+  --save_image 50 \
+  --save_ckpt 50
+```
+
+`--save_ckpt` and `--save_image` are measured in optimizer steps, not epochs.
+Checkpoints are atomically written to the two rolling files
+`LOG_DIR/ckpt/model_latest.pt` and `LOG_DIR/ckpt/model_best.pt`, while image
+filenames include the iteration and are never overwritten. The final state is
+always written to `model_latest.pt` when training exits normally.
+
+TensorBoard scalars are written every optimizer step under
+`LOG_DIR/tensorboard`. Start a viewer with
+`tensorboard --logdir LOG_DIR/tensorboard --port 6006`.
+
+To reuse the node-local mask cache when a pending Slurm job is assigned to a
+different node, run the cache listener separately from the training job:
+
+```bash
+nohup ./sync_sky_masks_when_allocated.sh JOB_ID babel-s5-32 \
+  > sync_sky_masks_JOB_ID.log 2>&1 &
+```
+
+The listener waits until Slurm reports the target node, then uses `rsync` to
+copy only masks that are not already present. If the job is assigned to the
+source node, no copy is performed. The synchronization runs concurrently with
+training; any mask that has not arrived yet is generated locally on demand.
 
 
 ### Zero-shot and trained experiment​s
