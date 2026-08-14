@@ -419,15 +419,23 @@ def build_birds_eye_render_poses(
     source_extrinsics,
     source_intrinsics,
     height,
+    source_image_height,
+    forward_extent_scale,
 ):
     """Build a downward-looking camera from an input camera's predicted coordinates.
 
     The virtual camera is shifted along the source camera's local up direction
     and looks along its local down direction. Its image top remains aligned with
-    the source camera's forward direction. ``height`` uses reconstruction units.
+    the source camera's forward direction. Extra canvas rows are added only above
+    the original view, preserving the original pixels below. ``height`` uses
+    reconstruction units.
     """
     if height <= 0:
         raise ValueError(f"height must be positive, got {height}.")
+    if forward_extent_scale < 1:
+        raise ValueError(
+            f"forward_extent_scale must be at least 1, got {forward_extent_scale}."
+        )
 
     device = source_extrinsics.device
     dtype = source_extrinsics.dtype
@@ -438,7 +446,18 @@ def build_birds_eye_render_poses(
         dtype=dtype,
     )
     source_to_birds_eye[2, 3] = height
-    return source_to_birds_eye.unsqueeze(0) @ source_extrinsics, source_intrinsics.clone()
+    birds_eye_intrinsics = source_intrinsics.clone()
+    extra_top_rows = int(round((float(forward_extent_scale) - 1.0) * source_image_height))
+    birds_eye_image_height = int(source_image_height) + extra_top_rows
+    if birds_eye_image_height % 2:
+        birds_eye_image_height += 1
+        extra_top_rows += 1
+    birds_eye_intrinsics[:, 1, 2] += extra_top_rows
+    return (
+        source_to_birds_eye.unsqueeze(0) @ source_extrinsics,
+        birds_eye_intrinsics,
+        birds_eye_image_height,
+    )
 
 
 def get_frame_ids_from_image_paths(image_paths):
@@ -663,6 +682,12 @@ def main():
         default=1.0,
         help='Virtual bird\'s-eye camera height in predicted reconstruction-coordinate units',
     )
+    parser.add_argument(
+        '--birds_eye_forward_scale',
+        type=float,
+        default=2.0,
+        help='Bird\'s-eye canvas height scale; extra rows are added only above the original view',
+    )
     parser.add_argument('--calibration_dir', type=str, help='Optional scene directory containing intrinsics/ and extrinsics/')
     parser.add_argument('--camera_rig_scale', type=float, help='Optional model-units-per-meter scale for Waymo camera rig translations')
     parser.add_argument('--assets_manifest', type=str, help='JSON manifest of converted external Gaussian assets')
@@ -781,6 +806,8 @@ def main():
             parser.error('--render_birds_eye requires exactly one front-camera input: --input_camera 0')
         if args.birds_eye_height <= 0:
             parser.error('--birds_eye_height must be positive')
+        if args.birds_eye_forward_scale < 1:
+            parser.error('--birds_eye_forward_scale must be at least 1')
         if args.render_all_cameras:
             parser.error('--render_birds_eye cannot be combined with --render_all_cameras')
 
@@ -1048,14 +1075,18 @@ def main():
                             + ", ".join(f"camera_{camera_id}={coverage:.4f}" for camera_id, coverage in frustum_coverage)
                         )
                     else:
-                        birds_eye_extrinsic, birds_eye_intrinsic = build_birds_eye_render_poses(
+                        birds_eye_extrinsic, birds_eye_intrinsic, birds_eye_image_height = build_birds_eye_render_poses(
                             reference_extrinsic,
                             reference_intrinsic,
                             args.birds_eye_height,
+                            H,
+                            args.birds_eye_forward_scale,
                         )
                         print(
                             f"Bird's-eye camera for scene {scene_name}: {args.birds_eye_height:.4f} "
-                            "reconstruction units above the front camera, looking down."
+                            "reconstruction units above the front camera, looking down; "
+                            f"top-expanded canvas scale={args.birds_eye_forward_scale:.3f}, "
+                            f"output size={W}x{birds_eye_image_height}."
                         )
                         if args.vlm_client is not None:
                             localization_frame_idx = len(reference_indices) - 1
@@ -1085,11 +1116,16 @@ def main():
                             )
                             localization_foregrounds = []
                             localization_alphas = []
-                            for localization_extrinsic, localization_intrinsic in (
-                                (extrinsic[localization_idx:localization_idx + 1], intrinsic[localization_idx:localization_idx + 1]),
+                            for localization_extrinsic, localization_intrinsic, localization_height in (
+                                (
+                                    extrinsic[localization_idx:localization_idx + 1],
+                                    intrinsic[localization_idx:localization_idx + 1],
+                                    H,
+                                ),
                                 (
                                     birds_eye_extrinsic[localization_frame_idx:localization_frame_idx + 1],
                                     birds_eye_intrinsic[localization_frame_idx:localization_frame_idx + 1],
+                                    birds_eye_image_height,
                                 ),
                             ):
                                 localization_render, localization_alpha, _ = rasterization(
@@ -1101,7 +1137,7 @@ def main():
                                     viewmats=localization_extrinsic,
                                     Ks=localization_intrinsic,
                                     width=W,
-                                    height=H,
+                                    height=localization_height,
                                     render_mode='RGB+ED',
                                 )
                                 localization_foregrounds.append(localization_render[..., :-1])
@@ -1117,7 +1153,7 @@ def main():
                                 source_intrinsic,
                                 birds_eye_extrinsic[localization_frame_idx:localization_frame_idx + 1],
                                 birds_eye_intrinsic[localization_frame_idx:localization_frame_idx + 1],
-                                output_height=H,
+                                output_height=birds_eye_image_height,
                                 output_width=W,
                             )
                             localization_frames = []
@@ -1431,13 +1467,13 @@ def main():
                                     scales=bird_world[3], quats=bird_world[4],
                                     viewmats=birds_eye_extrinsic[bird_preview_idx:bird_preview_idx + 1],
                                     Ks=birds_eye_intrinsic[bird_preview_idx:bird_preview_idx + 1],
-                                    width=W, height=H, render_mode="RGB+ED",
+                                    width=W, height=birds_eye_image_height, render_mode="RGB+ED",
                                 )
                                 bird_sky = model.sky_model.forward_with_new_pose(
                                     images, source_extrinsic, source_intrinsic,
                                     birds_eye_extrinsic[bird_preview_idx:bird_preview_idx + 1],
                                     birds_eye_intrinsic[bird_preview_idx:bird_preview_idx + 1],
-                                    output_height=H, output_width=W,
+                                    output_height=birds_eye_image_height, output_width=W,
                                 )
                                 bird_sky = (bird_sky - bird_sky.min()) / (
                                     bird_sky.max() - bird_sky.min() + 1e-8
@@ -1461,7 +1497,7 @@ def main():
                                 )
                                 bird_projected = bird_camera_point @ birds_eye_intrinsic[bird_preview_idx].transpose(0, 1)
                                 bird_pixel = bird_projected[:2] / bird_projected[2].clamp_min(1e-6)
-                                marker_radius = max(8, min(W, H) // 35)
+                                marker_radius = max(8, min(W, birds_eye_image_height) // 35)
                                 bird_x, bird_y = (float(value.item()) for value in bird_pixel)
                                 bird_draw.ellipse(
                                     (
@@ -1471,7 +1507,7 @@ def main():
                                         bird_y + marker_radius,
                                     ),
                                     outline="#ff1744",
-                                    width=max(3, min(W, H) // 180),
+                                    width=max(3, min(W, birds_eye_image_height) // 180),
                                 )
                                 bird_draw.text(
                                     (bird_x + marker_radius, bird_y), "INSERTED ASSET", fill="#ff1744"
@@ -1637,12 +1673,13 @@ def main():
                                     ],
                                 )
                         if args.render_birds_eye:
-                            for target_name, viewmats, Ks in (
-                                ("source", extrinsic[idx:idx + 1], intrinsic[idx:idx + 1]),
+                            for target_name, viewmats, Ks, target_height in (
+                                ("source", extrinsic[idx:idx + 1], intrinsic[idx:idx + 1], H),
                                 (
                                     "birds_eye",
                                     birds_eye_extrinsic[render_frame_idx:render_frame_idx + 1],
                                     birds_eye_intrinsic[render_frame_idx:render_frame_idx + 1],
+                                    birds_eye_image_height,
                                 ),
                             ):
                                 renders_chunk, alphas_chunk, _ = rasterization(
@@ -1654,7 +1691,7 @@ def main():
                                     viewmats=viewmats,
                                     Ks=Ks,
                                     width=W,
-                                    height=H,
+                                    height=target_height,
                                     render_mode='RGB+ED',
                                 )
                                 if target_name == "source":
@@ -1742,7 +1779,7 @@ def main():
                         source_intrinsic,
                         birds_eye_extrinsic,
                         birds_eye_intrinsic,
-                        output_height=H,
+                        output_height=birds_eye_image_height,
                         output_width=W,
                     )
                     birds_eye_bg_render = (
