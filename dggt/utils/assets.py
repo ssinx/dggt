@@ -253,6 +253,7 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         resolved_spec.setdefault("max_yaw_delta_deg", 90.0)
         resolved_spec.setdefault("min_scale_factor", 0.3)
         resolved_spec.setdefault("max_scale_factor", 4.0)
+        resolved_spec.setdefault("vlm_refinement_max_rounds", 5)
         if float(resolved_spec["scale"]) <= 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a non-positive scale.")
         if float(resolved_spec["opacity_scale"]) < 0:
@@ -281,6 +282,10 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         if float(resolved_spec["max_scale_factor"]) < float(resolved_spec["min_scale_factor"]):
             raise ValueError(
                 f"Asset {resolved_spec['id']} field max_scale_factor must be at least min_scale_factor."
+            )
+        if not 1 <= int(resolved_spec["vlm_refinement_max_rounds"]) <= 5:
+            raise ValueError(
+                f"Asset {resolved_spec['id']} field vlm_refinement_max_rounds must be in [1, 5]."
             )
         assets.append(resolved_spec)
     manifest["assets"] = assets
@@ -443,6 +448,8 @@ def select_asset_orientation_frames(
     image_width: int,
     placement_position_world: torch.Tensor,
     scene_units_per_meter: float,
+    rotation_delta_world: torch.Tensor | None = None,
+    asset_scale_factor: float = 1.0,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     """Select clear, diverse views using only asset projection geometry."""
     device = asset["means"].device
@@ -465,8 +472,15 @@ def select_asset_orientation_frames(
         if transform is None:
             continue
         rotation = transform[:3, :3]
+        if rotation_delta_world is not None:
+            rotation = torch.as_tensor(
+                rotation_delta_world, device=rotation.device, dtype=rotation.dtype
+            ) @ rotation
         world_means = (
-            local_means * float(spec["scale"]) @ rotation.transpose(0, 1)
+            local_means
+            * float(spec["scale"])
+            * float(asset_scale_factor)
+            @ rotation.transpose(0, 1)
         ) * float(scene_units_per_meter) + position
         extrinsic = frame_extrinsics[frame_index]
         intrinsic = frame_intrinsics[frame_index]

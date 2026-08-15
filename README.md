@@ -180,11 +180,12 @@ Optional per-asset manifest settings are:
   "orientation_projection_max_points": 3000,
   "max_yaw_delta_deg": 90,
   "min_scale_factor": 0.3,
-  "max_scale_factor": 4.0
+  "max_scale_factor": 4.0,
+  "vlm_refinement_max_rounds": 5
 }
 ```
 
-Set `vlm_orientation_refine` to `false` to retain both the manifest rotation and scale. Frame selection uses at most `orientation_projection_max_points` asset Gaussians and does not call VLM; only the selected previews are rendered, followed by one multi-image VLM request for that asset. The final effective scale is `scale * applied_scale_factor`. Debug artifacts are written to `vlm_orientation_refinement/<asset_id>/`: projection scores and selected frame IDs, raw unannotated previews, the red-box/red-circle images sent to Qwen, the complete request text, raw response, parsed yaw and scale instructions, initial/final transformations, and post-adjustment ground-snap diagnostics. The same data is embedded under `orientation_refinement` in `vlm_point_detections.json`. Final corrected frames remain under `source_camera/` and `birds_eye/`.
+Set `vlm_orientation_refine` to `false` to retain both the manifest rotation and scale. Frame selection uses at most `orientation_projection_max_points` asset Gaussians and does not call VLM. Otherwise, each round renders the current asset in the same selected views and asks Qwen whether both orientation and physical scale are satisfactory. A satisfactory response stops immediately; otherwise the returned incremental yaw and scale are applied, the asset is snapped to the ground again, and another round begins. `vlm_refinement_max_rounds` defaults to 5 and must be in `[1, 5]`. Cumulative scale remains within the manifest's global `min_scale_factor` and `max_scale_factor` bounds. Debug artifacts are written to `vlm_orientation_refinement/<asset_id>/round_XX/`, while the asset-level `result.json` contains all rounds and the final cumulative transformation. The same data is embedded under `orientation_refinement` in `vlm_point_detections.json`. Final corrected frames remain under `source_camera/` and `birds_eye/`.
 
 Install the optional client dependency and set an API key first:
 
