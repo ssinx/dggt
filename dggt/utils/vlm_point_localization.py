@@ -171,6 +171,9 @@ def refine_asset_orientation(
     max_yaw_delta_deg: float,
     min_scale_factor: float,
     max_scale_factor: float,
+    round_index: int,
+    max_rounds: int,
+    current_cumulative_scale_factor: float,
     retries: int,
     enable_thinking: bool,
 ) -> dict[str, Any]:
@@ -180,7 +183,8 @@ def refine_asset_orientation(
     saved_images = []
     content: list[dict[str, Any]] = []
     instruction = (
-        "You inspect an initially inserted 3D Gaussian asset in a driving scene and decide whether its "
+        f"This is refinement round {round_index} of at most {max_rounds}. You inspect the CURRENTLY rendered "
+        "3D Gaussian asset in a driving scene and decide whether its "
         "horizontal orientation and uniform physical scale need correction. Images are labeled as front-view "
         "or bird's-eye previews. "
         "Use all views together and follow the user's placement request. The asset's local coordinate axes are "
@@ -197,11 +201,16 @@ def refine_asset_orientation(
         "evidence that the current physical size is already appropriate, not merely because the estimate is "
         "uncertain. Use decisive values such as 0.4, 0.5, 0.67, 0.8, 1.25, 1.5, 2.0, 2.5, 3.0, or 4.0 when "
         "supported by the scene; intermediate values are also allowed. Account for perspective across views and "
-        "do not shrink an asset merely because it is far from the camera. Return only one JSON object with no Markdown: "
-        '{"yaw_delta_deg":0.0,"scale_factor":1.0,"confidence":0.0,"reason":"string"}. '
+        "do not shrink an asset merely because it is far from the camera. First decide whether the current result "
+        "is already satisfactory for BOTH orientation and physical scale. If it is satisfactory, set satisfied=true, "
+        "yaw_delta_deg=0, and scale_factor=1. If either property still needs correction, set satisfied=false and "
+        "return the full incremental correction relative to the CURRENT render. Do not mark a visibly imperfect "
+        "result as satisfactory merely to avoid another round. Return only one JSON object with no Markdown: "
+        '{"satisfied":false,"yaw_delta_deg":0.0,"scale_factor":1.0,"confidence":0.0,"reason":"string"}. '
         f"The yaw correction must be in [-{max_yaw_delta_deg:.3f}, {max_yaw_delta_deg:.3f}] degrees and "
         f"scale_factor must be in [{min_scale_factor:.4f}, {max_scale_factor:.4f}].\n\n"
-        f"Asset id: {asset_id}\nUser request: {user_prompt}"
+        f"Current cumulative scale factor relative to the manifest scale: "
+        f"{current_cumulative_scale_factor:.6f}.\nAsset id: {asset_id}\nUser request: {user_prompt}"
     )
     content.append({"type": "input_text", "text": instruction})
     for image_index, (view_name, frame_index, frame) in enumerate(preview_frames):
@@ -239,10 +248,13 @@ def refine_asset_orientation(
             parsed = json.loads(_strip_json_fence(raw_response))
             if not isinstance(parsed, dict):
                 raise ValueError("Orientation response is not a JSON object.")
+            satisfied = parsed.get("satisfied")
             yaw = parsed.get("yaw_delta_deg")
             scale_factor = parsed.get("scale_factor")
             confidence = parsed.get("confidence")
             reason = parsed.get("reason")
+            if not isinstance(satisfied, bool):
+                raise ValueError("Orientation response has invalid satisfied flag.")
             if not isinstance(yaw, (int, float)) or not np.isfinite(yaw):
                 raise ValueError("Orientation response has invalid yaw_delta_deg.")
             if not isinstance(scale_factor, (int, float)) or not np.isfinite(scale_factor):
@@ -252,25 +264,32 @@ def refine_asset_orientation(
             if not isinstance(reason, str):
                 raise ValueError("Orientation response has invalid reason.")
             requested_yaw = float(yaw)
-            applied_yaw = float(np.clip(requested_yaw, -max_yaw_delta_deg, max_yaw_delta_deg))
+            bounded_yaw = float(np.clip(requested_yaw, -max_yaw_delta_deg, max_yaw_delta_deg))
             requested_scale_factor = float(scale_factor)
-            applied_scale_factor = float(
+            bounded_scale_factor = float(
                 np.clip(requested_scale_factor, min_scale_factor, max_scale_factor)
             )
+            applied_yaw = 0.0 if satisfied else bounded_yaw
+            applied_scale_factor = 1.0 if satisfied else bounded_scale_factor
             result = {
-                "status": "refined",
+                "status": "satisfied" if satisfied else "adjustment_requested",
                 "asset_id": asset_id,
+                "round_index": int(round_index),
+                "satisfied": satisfied,
                 "yaw_convention": "positive_is_clockwise_in_birds_eye_view",
                 "requested_yaw_delta_deg": requested_yaw,
                 "applied_yaw_delta_deg": applied_yaw,
                 "was_clamped": (
-                    requested_yaw != applied_yaw
-                    or requested_scale_factor != applied_scale_factor
+                    requested_yaw != bounded_yaw
+                    or requested_scale_factor != bounded_scale_factor
                 ),
                 "requested_scale_factor": requested_scale_factor,
                 "applied_scale_factor": applied_scale_factor,
-                "yaw_was_clamped": requested_yaw != applied_yaw,
-                "scale_was_clamped": requested_scale_factor != applied_scale_factor,
+                "yaw_was_clamped": requested_yaw != bounded_yaw,
+                "scale_was_clamped": requested_scale_factor != bounded_scale_factor,
+                "correction_ignored_because_satisfied": bool(
+                    satisfied and (requested_yaw != 0 or requested_scale_factor != 1)
+                ),
                 "confidence": float(confidence),
                 "reason": reason,
                 "input_images": saved_images,
@@ -289,6 +308,8 @@ def refine_asset_orientation(
     failure = {
         "status": "fallback_vlm_error",
         "asset_id": asset_id,
+        "round_index": int(round_index),
+        "satisfied": False,
         "applied_yaw_delta_deg": 0.0,
         "applied_scale_factor": 1.0,
         "error": f"{type(last_error).__name__}: {last_error}",
