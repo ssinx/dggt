@@ -179,8 +179,8 @@ Optional per-asset manifest settings are:
   "orientation_top_k": 3,
   "orientation_projection_max_points": 3000,
   "max_yaw_delta_deg": 90,
-  "min_scale_factor": 0.5,
-  "max_scale_factor": 2.0
+  "min_scale_factor": 0.3,
+  "max_scale_factor": 4.0
 }
 ```
 
