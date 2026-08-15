@@ -251,8 +251,8 @@ def load_asset_manifest(manifest_path: str | Path) -> dict[str, Any]:
         resolved_spec.setdefault("orientation_top_k", 3)
         resolved_spec.setdefault("orientation_projection_max_points", 3000)
         resolved_spec.setdefault("max_yaw_delta_deg", 90.0)
-        resolved_spec.setdefault("min_scale_factor", 0.5)
-        resolved_spec.setdefault("max_scale_factor", 2.0)
+        resolved_spec.setdefault("min_scale_factor", 0.3)
+        resolved_spec.setdefault("max_scale_factor", 4.0)
         if float(resolved_spec["scale"]) <= 0:
             raise ValueError(f"Asset {resolved_spec['id']} has a non-positive scale.")
         if float(resolved_spec["opacity_scale"]) < 0:
