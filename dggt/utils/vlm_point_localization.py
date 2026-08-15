@@ -35,6 +35,9 @@ def localize_corresponding_points_in_frame(
     """Locate corresponding points in one frame and triangulate their world positions."""
     front_frame = _ensure_rgb_frame(front_frame)
     birds_eye_frame = _ensure_rgb_frame(birds_eye_frame)
+    output_path = Path(output_path)
+    visualization_dir = output_path.parent / "vlm_point_visualizations"
+    frame_suffix = f"{frame_index:04d}"
     front_height, front_width = front_frame.shape[:2]
     birds_height, birds_width = birds_eye_frame.shape[:2]
     front_detections = _request_point_detections(
@@ -49,7 +52,7 @@ def localize_corresponding_points_in_frame(
     front_points = [_to_pixel_coordinates(point, front_width, front_height) for point in front_detections]
 
     correspondences = []
-    for front_point in front_points:
+    for point_index, front_point in enumerate(front_points):
         front_pixel = front_point["coordinate_2d_pixels_xy"]
         line = epipolar_line_from_pixel(
             front_pixel,
@@ -58,12 +61,25 @@ def localize_corresponding_points_in_frame(
             birds_eye_extrinsic,
             birds_eye_intrinsic,
         )
+        annotated_front = _draw_point_visualization(front_frame, [front_point])
         annotated_birds_eye = _draw_constraint_line(birds_eye_frame, line)
+        pair_suffix = f"{frame_suffix}_point_{point_index:02d}"
+        front_reference_path = visualization_dir / f"front_reference_{pair_suffix}.png"
+        birds_constraint_path = visualization_dir / f"birds_eye_constraint_{pair_suffix}.png"
+        front_reference_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(annotated_front).save(front_reference_path)
+        Image.fromarray(annotated_birds_eye).save(birds_constraint_path)
         bird_prompt = (
             f"Find the same EMPTY PLACEMENT POINT labeled {front_point['label']!r} that was selected in the front view. "
+            f"The front-view VLM described it as {front_point['label']!r}, with confidence "
+            f"{front_point['confidence']:.3f}, at front-view pixel {front_pixel}. "
+            "Image 1 is the reference front view and marks this selected location with a red point. "
+            "Image 2 is the target bird's-eye view and contains the red epipolar constraint line. "
             "This is a vacant ground location where a new asset will be inserted, not the location of an existing object. "
-            "The valid location is restricted to the red epipolar line drawn on this bird's-eye image. "
-            "Return exactly one point on that red line. Original request: " + prompt
+            "Use the road layout, nearby objects, and relative position in Image 1 to identify the same physical "
+            "location in Image 2. The valid location is restricted to the red line in Image 2. "
+            "Return exactly one coordinate in Image 2, never the red point coordinate from Image 1. Original request: "
+            + prompt
         )
         detections = _request_point_detections(
             client,
@@ -73,6 +89,15 @@ def localize_corresponding_points_in_frame(
             retries,
             enable_thinking,
             selection_mode="empty_placement_point",
+            context_images=[
+                (
+                    "REFERENCE IMAGE 1: front view with the selected empty placement point marked in red",
+                    annotated_front,
+                )
+            ],
+            primary_image_label=(
+                "TARGET IMAGE 2: bird's-eye view; return a point on the red epipolar line in this image"
+            ),
         )
         if len(detections) != 1:
             raise ValueError(
@@ -98,12 +123,17 @@ def localize_corresponding_points_in_frame(
                 "birds_eye_epipolar_line": [float(value) for value in line],
                 "world_coordinate_xyz": [float(value) for value in world_point],
                 "triangulation_ray_error": float(ray_error),
+                "birds_eye_vlm_request": {
+                    "prompt": bird_prompt,
+                    "front_reference_image_path": str(front_reference_path),
+                    "birds_eye_constraint_image_path": str(birds_constraint_path),
+                    "front_point_description": front_point["label"],
+                    "front_point_confidence": float(front_point["confidence"]),
+                    "front_point_pixels_xy": list(front_pixel),
+                },
             }
         )
 
-    output_path = Path(output_path)
-    visualization_dir = output_path.parent / "vlm_point_visualizations"
-    frame_suffix = f"{frame_index:04d}"
     _save_point_visualization(
         front_frame,
         front_points,
@@ -483,8 +513,10 @@ def _request_point_detections(
     retries: int,
     enable_thinking: bool,
     selection_mode: str = "visible_object_or_feature",
+    context_images: list[tuple[str, Any]] | None = None,
+    primary_image_label: str = "TARGET IMAGE: return coordinates in this image",
 ) -> list[dict[str, Any]]:
-    image_data_url = _frame_to_png_data_url(frame)
+    context_images = context_images or []
     if selection_mode == "empty_placement_point":
         task_instruction = (
             "This is an ASSET INSERTION placement task, not an object-detection task. Infer how many new "
@@ -506,15 +538,28 @@ def _request_point_detections(
     else:
         raise ValueError(f"Unknown VLM point selection mode: {selection_mode}")
     instruction = (
-        "You locate visual points in one rendered driving-scene image. "
+        "You locate visual points in one or more rendered driving-scene images. "
         + task_instruction
         + " Coordinates are image-plane [x, y] integers normalized to [0, 1000], "
-        "where [0, 0] is the top-left corner. Do not infer occluded or off-image locations. "
+        "where [0, 0] is the top-left corner. Return coordinates ONLY for the explicitly labeled TARGET image; "
+        "other images are reference context and use their own independent pixel coordinates. "
+        "Do not infer occluded or off-image locations. "
         "Return only a JSON object in this exact format, with no Markdown or explanation: "
         '{"coordinate_frame":"image_2d_normalized_xy_1000","points":['
         '{"label":"string","point_2d_1000":[0,0],"confidence":0.0}]}. '
         "Return an empty points list when nothing matches.\n\n"
         f"User request: {user_prompt}"
+    )
+    request_content: list[dict[str, Any]] = [{"type": "input_text", "text": instruction}]
+    for image_label, context_image in context_images:
+        context_frame = _ensure_rgb_frame(context_image)
+        request_content.append({"type": "input_text", "text": image_label})
+        request_content.append(
+            {"type": "input_image", "image_url": _frame_to_png_data_url(context_frame)}
+        )
+    request_content.append({"type": "input_text", "text": primary_image_label})
+    request_content.append(
+        {"type": "input_image", "image_url": _frame_to_png_data_url(_ensure_rgb_frame(frame))}
     )
 
     for attempt in range(retries + 1):
@@ -524,10 +569,7 @@ def _request_point_detections(
                 input=[
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": instruction},
-                            {"type": "input_image", "image_url": image_data_url},
-                        ],
+                        "content": request_content,
                     }
                 ],
                 extra_body={"enable_thinking": enable_thinking},
@@ -619,7 +661,7 @@ def _to_pixel_coordinates(point: dict[str, Any], width: int, height: int) -> dic
     }
 
 
-def _save_point_visualization(frame: Any, points: list[dict[str, Any]], output_path: Path) -> None:
+def _draw_point_visualization(frame: Any, points: list[dict[str, Any]]) -> np.ndarray:
     image = Image.fromarray(frame)
     draw = ImageDraw.Draw(image)
     width, height = image.size
@@ -647,5 +689,9 @@ def _save_point_visualization(frame: Any, points: list[dict[str, Any]], output_p
         draw.rectangle(text_box, fill="#000000")
         draw.text(text_anchor, label, fill="#ffffff")
 
+    return np.asarray(image)
+
+
+def _save_point_visualization(frame: Any, points: list[dict[str, Any]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path)
+    Image.fromarray(_draw_point_visualization(frame, points)).save(output_path)
