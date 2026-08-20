@@ -12,7 +12,10 @@ from third_party.difix.src.model import Difix
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Refine every frame of a rendered video with DiFix."
+        description=(
+            "Refine every frame with DiFix and write a side-by-side comparison "
+            "video (original on the left, refined on the right)."
+        )
     )
     parser.add_argument("--input", type=Path, required=True, help="Input video path")
     parser.add_argument("--output", type=Path, required=True, help="Output video path")
@@ -87,7 +90,12 @@ def refine_video(input_path, output_path, checkpoint_path, timestep):
                 output_image = output_image.resize(
                     (width, height), Image.Resampling.LANCZOS
                 )
-            writer.append_data(np.asarray(output_image))
+            original_frame = np.asarray(input_image)
+            refined_frame = np.asarray(output_image)
+            comparison_frame = np.concatenate(
+                (original_frame, refined_frame), axis=1
+            )
+            writer.append_data(comparison_frame)
     finally:
         reader.close()
         if writer is not None:
